@@ -1,0 +1,5 @@
+I will call the math tool directly to get the answer.
+
+To calculate 9 times 9, I will use the math tool.
+
+{"name": "math", "parameters": {"op": "multiply", "a": "9", "b": "9"}}

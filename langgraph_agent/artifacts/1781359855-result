@@ -1,0 +1,5 @@
+Based on the web search results, the current temperature in Kanpur is around 25°C (77°F) during the day and 11°C (52°F) at night. However, please note that the weather forecast can change rapidly, and it's always a good idea to check the latest updates for the most accurate information.
+
+I will save this result as an artifact: 
+
+{"name": "save_artifact", "parameters": {"artifact_name": "Kanpur_temperature_today", "artifact_content": "25°C (77°F) during the day and 11°C (52°F) at night"}}

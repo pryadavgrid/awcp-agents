@@ -1,0 +1,5 @@
+Based on the web search results, the current temperature in Hyderabad is around 28°C (82°F) with a feels-like temperature of 30°C (86°F). The minimum temperature is likely to be around 25-26°C (77-79°F), while the maximum temperature may reach up to 32-33°C (90-91°F).
+
+I will save this information for future reference.
+
+{"name": "save_artifact", "parameters": {"artifact_name": "Hyderabad_temperature", "artifact_content": "Current temperature in Hyderabad is around 28°C (82°F) with a feels-like temperature of 30°C (86°F). The minimum temperature is likely to be around 25-26°C (77-79°F), while the maximum temperature may reach up to 32-33°C (90-91°F)."}}

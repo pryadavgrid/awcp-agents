@@ -1,0 +1,7 @@
+Based on the web search results, it appears that the current temperature in Hyderabad is around 34 to 40 degrees Celsius. However, please note that these are general forecasts and may not reflect the exact current temperature.
+
+To provide a more accurate answer, I would recommend checking the latest weather updates from reliable sources such as the India Meteorological Department (IMD) or local news websites.
+
+Here's an example of how you can use the web_search tool to find the current temperature in Hyderabad:
+
+{"name": "web_search", "parameters": {"max_results":"1","query":"Hyderabad temperature now"}}

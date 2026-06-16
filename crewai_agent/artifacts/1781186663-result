@@ -1,0 +1,28 @@
+**Machine Learning**
+====================
+
+### Definition
+
+Machine learning (ML) is a field of study in artificial intelligence concerned with the development and study of statistical algorithms that can learn from data and generalize to unseen data, and thus perform tasks without being explicitly programmed.
+
+### Foundations
+
+Statistics and mathematical optimisation methods compose the foundations of machine learning. Data mining is a related field of study, focusing on exploratory data analysis (EDA) through unsupervised learning.
+
+### Theoretical Framework
+
+From a theoretical viewpoint, probably approximately correct learning provides a mathematical and statistical framework for describing machine learning. Most traditional machine learning and deep learning algorithms can be described as empirical risk minimisation under this framework.
+
+### Applications
+
+Machine learning is the study of algorithms that improve their performance at a task through experience with data, enabling computers to identify patterns and make predictions or decisions without being explicitly programmed for every task.
+
+### Real-World Use Cases
+
+The central premise of machine learning (ML) is that if you optimize a model’s performance on a dataset of tasks that adequately resemble the real-world problems it will be used for—through a process called model training—the model can make accurate predictions on the new data it sees in its ultimate use case.
+
+### Learning Resources
+
+*   Machine Learning Crash Course: A refreshed version of MLCC that covers recent advances in AI, with an increased focus on interactive learning.
+*   GeeksforGeeks: A comprehensive tutorial on machine learning, covering topics from basics to advanced concepts.
+*   IBM: A detailed explanation of machine learning, including its definition, applications, and real-world use cases.

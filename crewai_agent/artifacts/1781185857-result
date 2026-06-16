@@ -1,0 +1,21 @@
+**Python Programming**
+======================
+
+Python is a high-level, general-purpose programming language that emphasizes code readability, simplicity, and ease-of-writing with the use of significant indentation, "plain English" naming, an extensive ("batteries-included") standard library, and garbage collection.
+
+**History and Development**
+---------------------------
+
+Guido van Rossum began working on Python in the late 1980s as a successor to the ABC programming language. Python 3.0, released in 2008, was a major revision and not completely backward-compatible with earlier versions. Beginning with Python 3.5, capabilities and keywords for typing were added to the language, allowing optional static typing.
+
+**Features and Uses**
+---------------------
+
+Python supports multiple programming paradigms but with an emphasis on object-oriented programming and dynamic typing. It is widely taught as an introductory programming language and has gained extensive use in the machine learning community. Python has consistently ranked among the top ten most popular programming languages in the TIOBE Programming Community Index, which ranks programming languages based on searches across 24 platforms.
+
+**Resources**
+-------------
+
+*   [Python.org](https://www.python.org/)
+*   [W3Schools: Introduction to Python](https://www.w3schools.com/Python/python_intro.asp)
+*   [GeeksforGeeks: Python Programs](https://www.geeksforgeeks.org/python/python-programming-examples/)

@@ -1,0 +1,5 @@
+Based on the web search results, I am unable to find the current temperature in Hyderabad. However, you can check the links provided above for the latest hourly weather updates and forecasts.
+
+Let me try again with a different approach.
+
+{"name": "web_search", "parameters": {"max_results":"1","query":"current temperature in hyderabad"}}

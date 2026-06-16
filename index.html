@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AWCP Agent Control Panel</title>
+  <style>
+    :root {
+      --bg: #080d14;
+      --surface: #0f1724;
+      --border: #1a2640;
+      --fg: #e2e8f0;
+      --muted: #64748b;
+      --ok: #22c55e;
+      --off: #374151;
+      --red: #ef4444;
+      --radius: 14px;
+    }
+
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+    }
+
+    /* ---------- layout ---------- */
+    .shell {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 20px 60px;
+    }
+
+    /* ---------- header ---------- */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 28px 0 24px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+    }
+
+    .header-title h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+    }
+
+    .header-title p {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 2px;
+    }
+
+    .header-actions {
+      margin-left: auto;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 5px 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .status-pill .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--ok);
+    }
+
+    /* ---------- buttons ---------- */
+    btn,
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: none;
+      border-radius: 9px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      text-decoration: none;
+    }
+
+    .btn:active {
+      transform: scale(.97);
+    }
+
+    .btn-primary {
+      background: #3b5bdb;
+      color: #fff;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--fg);
+    }
+
+    .btn-sm {
+      padding: 5px 11px;
+      font-size: 12px;
+      border-radius: 7px;
+    }
+
+    .btn-danger {
+      background: transparent;
+      border: 1px solid #3f1d1d;
+      color: #f87171;
+    }
+
+    .btn:disabled {
+      opacity: .4;
+      cursor: default;
+    }
+
+    /* ---------- grid ---------- */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+      gap: 16px;
+    }
+
+    @media (max-width: 500px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* ---------- agent card ---------- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      position: relative;
+      transition: border-color 0.2s;
+    }
+
+    .card:hover {
+      border-color: #263352;
+    }
+
+    .card-accent {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      border-radius: var(--radius) 0 0 var(--radius);
+    }
+
+    .card-body {
+      padding: 18px 20px 16px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* card top row */
+    .card-top {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .agent-icon {
+      font-size: 22px;
+      line-height: 1;
+      flex: none;
+      margin-top: 1px;
+    }
+
+    .agent-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .agent-name {
+      font-size: 15px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .agent-desc {
+      color: var(--muted);
+      font-size: 12.5px;
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* toggle */
+    .toggle-wrap {
+      flex: none;
+      display: flex;
+      align-items: center;
+    }
+
+    .toggle-input {
+      display: none;
+    }
+
+    .toggle-label {
+      position: relative;
+      display: inline-block;
+      width: 50px;
+      height: 27px;
+      background: var(--off);
+      border-radius: 14px;
+      cursor: pointer;
+      transition: background 0.22s;
+    }
+
+    .toggle-label::after {
+      content: '';
+      position: absolute;
+      width: 21px;
+      height: 21px;
+      background: #fff;
+      border-radius: 50%;
+      top: 3px;
+      left: 3px;
+      transition: transform 0.22s cubic-bezier(.4, 0, .2, 1), box-shadow 0.22s;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, .4);
+    }
+
+    .toggle-input:checked+.toggle-label {
+      background: var(--ok);
+    }
+
+    .toggle-input:checked+.toggle-label::after {
+      transform: translateX(23px);
+    }
+
+    .toggle-input:disabled+.toggle-label {
+      opacity: .5;
+      cursor: default;
+    }
+
+    /* tags */
+    .tags {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .tag {
+      font-size: 11px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      background: rgba(255, 255, 255, .04);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 2px 7px;
+      color: var(--muted);
+    }
+
+    /* card footer */
+    .card-footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--off);
+      transition: background 0.3s;
+      flex: none;
+    }
+
+    .status-dot.running {
+      background: var(--ok);
+      box-shadow: 0 0 0 0 rgba(34, 197, 94, .5);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0% {
+        box-shadow: 0 0 0 0 rgba(34, 197, 94, .5);
+      }
+
+      70% {
+        box-shadow: 0 0 0 6px rgba(34, 197, 94, 0);
+      }
+
+      100% {
+        box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+      }
+    }
+
+    .footer-links {
+      margin-left: auto;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    a.open-ui {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #93c5fd;
+      text-decoration: none;
+      border: 1px solid #1e3a5f;
+      border-radius: 7px;
+      padding: 4px 10px;
+      transition: background 0.15s;
+    }
+
+    a.open-ui:hover {
+      background: rgba(147, 197, 253, .08);
+    }
+
+    a.open-ui[hidden] {
+      display: none;
+    }
+
+    a.about-link {
+      font-size: 12px;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 4px 8px;
+      border-radius: 7px;
+      transition: color 0.15s;
+    }
+
+    a.about-link:hover {
+      color: var(--fg);
+    }
+
+    /* ---------- empty / error ---------- */
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 60px 20px;
+      font-size: 14px;
+      grid-column: 1 / -1;
+    }
+
+    .error-banner {
+      background: #1a0a0a;
+      border: 1px solid #3f1d1d;
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: #f87171;
+      font-size: 13px;
+      margin-bottom: 20px;
+      display: none;
+    }
+
+    .error-banner.visible {
+      display: block;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+
+    <!-- header -->
+    <header class="header">
+      <div class="header-title">
+        <h1>AWCP Agent Control Panel</h1>
+        <p id="status-text">Connecting to control panel&hellip;</p>
+      </div>
+      <div class="header-actions">
+        <button class="btn btn-ghost btn-sm" id="btn-start-all">Start all</button>
+        <button class="btn btn-danger btn-sm" id="btn-stop-all">Stop all</button>
+      </div>
+    </header>
+
+    <!-- error banner -->
+    <div class="error-banner" id="error-banner">
+      Cannot reach the control panel API at <strong id="api-url-display"></strong>.
+      Make sure <code>python3 control_panel.py</code> is running.
+    </div>
+
+    <!-- agent grid -->
+    <div class="grid" id="grid"></div>
+
+  </div>
+
+  <script>
+    // ---------- agent static metadata ----------
+    const META = {
+      langgraph_agent: {
+        label: 'LangGraph',
+        icon: '🧠',
+        desc: 'General-purpose autonomous worker — ReAct loop over Ollama',
+        framework: 'LangGraph',
+        model: 'llama3.1:8b',
+        defaultPort: 8100,
+        color: '#818cf8',
+        about: 'langgraph_agent/about.html',
+      },
+      crewai_agent: {
+        label: 'CrewAI',
+        icon: '👥',
+        desc: 'Single-agent crew that executes goals as structured tasks',
+        framework: 'CrewAI',
+        model: 'llama3.1:8b',
+        defaultPort: 8101,
+        color: '#fb923c',
+        about: 'crewai_agent/about.html',
+      },
+      pydanticai_agent: {
+        label: 'PydanticAI',
+        icon: '🔷',
+        desc: 'Typed, schema-validated autonomous worker via PydanticAI',
+        framework: 'PydanticAI',
+        model: 'llama3.1:8b',
+        defaultPort: 8102,
+        color: '#60a5fa',
+        about: 'pydanticai_agent/about.html',
+      },
+      arxiv_agent: {
+        label: 'arXiv Research',
+        icon: '📚',
+        desc: 'Academic research worker — searches the free arXiv API',
+        framework: 'LangGraph (ReAct)',
+        model: 'llama3.1:8b',
+        defaultPort: 8103,
+        color: '#34d399',
+        about: 'arxiv_agent/about.html',
+      },
+    };
+
+    // ---------- API base ----------
+    // Prefer same-origin (works when served by control_panel.py at :8099).
+    // Falls back to absolute URL if opened from file:// or a different port.
+    const API = (window.location.protocol === 'http:' && window.location.port === '8099')
+      ? ''
+      : 'http://localhost:8099';
+
+    document.getElementById('api-url-display').textContent = API || window.location.origin;
+
+    async function apiFetch(path, method = 'GET') {
+      return fetch(API + path, { method });
+    }
+
+    // ---------- state ----------
+    let agentState = {};   // id → { running, pids, port }
+    let pending = {};      // id → true  (toggle in-flight)
+
+    // ---------- render ----------
+    function renderGrid(agents) {
+      const grid = document.getElementById('grid');
+
+      if (!agents.length) {
+        grid.innerHTML = '<div class="empty">No agent folders found with a run.sh.</div>';
+        return;
+      }
+
+      // preserve existing DOM nodes when possible (avoid flicker)
+      const existing = new Set([...grid.querySelectorAll('.card')].map(c => c.dataset.id));
+      const fresh = new Set(agents.map(a => a.id));
+
+      // remove stale cards
+      existing.forEach(id => {
+        if (!fresh.has(id)) grid.querySelector(`[data-id="${id}"]`).remove();
+      });
+
+      agents.forEach(a => {
+        const m = META[a.id] || { label: a.id, icon: '⚙️', desc: '', framework: '?', model: '?', defaultPort: null, color: '#6b7280', about: null };
+        const port = a.port || m.defaultPort;
+        const running = a.running;
+
+        if (!existing.has(a.id)) {
+          // create card
+          grid.insertAdjacentHTML('beforeend', cardHTML(a.id, m, running, a.pids, port));
+          // attach toggle listener
+          grid.querySelector(`#toggle-${a.id}`).addEventListener('change', e => {
+            onToggle(a.id, e.target.checked);
+          });
+        } else {
+          // update in-place (no DOM rebuild)
+          updateCard(a.id, running, a.pids, port);
+        }
+      });
+
+      // re-order cards to match API order
+      agents.forEach(a => {
+        const node = grid.querySelector(`[data-id="${a.id}"]`);
+        if (node) grid.appendChild(node);
+      });
+    }
+
+    function cardHTML(id, m, running, pids, port) {
+      const openHref = port ? `http://localhost:${port}` : '#';
+      const openHidden = port ? '' : 'hidden';
+      const statusText = running ? `Running · PID ${(pids || []).join(', ')}` : 'Stopped';
+      const dotClass = running ? 'running' : '';
+      const checked = running ? 'checked' : '';
+
+      return `
+  <div class="card" data-id="${id}">
+    <div class="card-accent" style="background:${m.color}"></div>
+    <div class="card-body">
+      <div class="card-top">
+        <span class="agent-icon">${m.icon}</span>
+        <div class="agent-info">
+          <div class="agent-name">${m.label}</div>
+          <div class="agent-desc">${m.desc}</div>
+        </div>
+        <div class="toggle-wrap">
+          <input type="checkbox" class="toggle-input" id="toggle-${id}" ${checked}>
+          <label class="toggle-label" for="toggle-${id}" title="Start / Stop ${m.label}"></label>
+        </div>
+      </div>
+      <div class="tags">
+        <span class="tag">${m.framework}</span>
+        <span class="tag">${m.model}</span>
+        ${port ? `<span class="tag">:${port}</span>` : ''}
+      </div>
+      <div class="card-footer">
+        <div class="status-badge">
+          <span class="status-dot ${dotClass}" id="dot-${id}"></span>
+          <span id="status-${id}">${statusText}</span>
+        </div>
+        <div class="footer-links">
+          <a class="open-ui" href="${openHref}" target="_blank" id="open-${id}" ${openHidden}>
+            Open UI &rarr;
+          </a>
+          ${m.about ? `<a class="about-link" href="${m.about}" target="_blank">About</a>` : ''}
+        </div>
+      </div>
+    </div>
+  </div>`;
+    }
+
+    function updateCard(id, running, pids, port) {
+      const isPending = pending[id];
+      const toggle = document.getElementById(`toggle-${id}`);
+      const dot = document.getElementById(`dot-${id}`);
+      const statusEl = document.getElementById(`status-${id}`);
+      const openEl = document.getElementById(`open-${id}`);
+
+      if (toggle && !isPending) toggle.checked = running;
+      if (dot) { dot.className = 'status-dot' + (running ? ' running' : ''); }
+      if (statusEl) statusEl.textContent = running ? `Running · PID ${(pids || []).join(', ')}` : 'Stopped';
+      if (openEl) {
+        const href = port ? `http://localhost:${port}` : '#';
+        openEl.href = href;
+        openEl.hidden = !port;
+      }
+    }
+
+    // ---------- toggle handler ----------
+    async function onToggle(id, wantRunning) {
+      if (pending[id]) return;
+      pending[id] = true;
+
+      // disable toggle while in-flight
+      const toggle = document.getElementById(`toggle-${id}`);
+      if (toggle) toggle.disabled = true;
+
+      try {
+        const action = wantRunning ? 'start' : 'stop';
+        await apiFetch(`/api/agents/${id}/${action}`, 'POST');
+        const delay = wantRunning ? 1600 : 700;
+        setTimeout(() => { delete pending[id]; refresh(); }, delay);
+      } catch {
+        delete pending[id];
+        if (toggle) { toggle.disabled = false; toggle.checked = !wantRunning; }
+      }
+    }
+
+    // ---------- bulk actions ----------
+    document.getElementById('btn-start-all').addEventListener('click', async () => {
+      await apiFetch('/api/start-all', 'POST');
+      setTimeout(refresh, 1800);
+    });
+    document.getElementById('btn-stop-all').addEventListener('click', async () => {
+      await apiFetch('/api/stop-all', 'POST');
+      setTimeout(refresh, 800);
+    });
+
+    // ---------- polling ----------
+    const errorBanner = document.getElementById('error-banner');
+    const statusText = document.getElementById('status-text');
+
+    async function refresh() {
+      try {
+        const resp = await apiFetch('/api/agents');
+        const agents = await resp.json();
+        errorBanner.classList.remove('visible');
+
+        // re-enable any toggles no longer pending
+        agents.forEach(a => {
+          if (!pending[a.id]) {
+            const t = document.getElementById(`toggle-${a.id}`);
+            if (t) t.disabled = false;
+          }
+          agentState[a.id] = a;
+        });
+
+        renderGrid(agents);
+
+        const running = agents.filter(a => a.running).length;
+        statusText.textContent = `${agents.length} agent${agents.length !== 1 ? 's' : ''} discovered · ${running} running`;
+      } catch {
+        errorBanner.classList.add('visible');
+        statusText.textContent = 'Control panel unreachable';
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+
+</html>

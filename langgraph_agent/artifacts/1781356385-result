@@ -1,0 +1,5 @@
+Based on the web search results, the current temperature in Hyderabad is around 96°F (35°C) with a RealFeel Temperature of 105°F. The minimum temperature is likely to be around 27°C, while the maximum temperature may reach up to 36°C.
+
+I will save this result as an artifact for future reference:
+
+`save_artifact("Hyderabad temperature", "Current temperature in Hyderabad: 96°F (35°C) with a RealFeel Temperature of 105°F")`

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CrewAI Worker — About</title>
+<style>
+  :root{--ink:#15202b;--mut:#5b6b7a;--line:#e1e6ea;--bg:#fff;--accent:#0a7d6b;
+        --read:#0a7d33;--readbg:#eafaf0;--med:#b45309;--medbg:#fdf3e7;--high:#b91c1c;--highbg:#fdecea;
+        --code:#0e1426;--codefg:#e7e9ee;--cm:#7fd18b;--str:#ecc48d;--kw:#c792ea;--mono:Consolas,"SFMono-Regular",monospace}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Helvetica,sans-serif;color:var(--ink);background:var(--bg);line-height:1.6}
+  .page{max-width:920px;margin:0 auto;padding:42px 34px 80px}
+  h1{font-size:28px;margin:0 0 4px} h2{font-size:21px;margin:38px 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}
+  h3{font-size:16px;margin:20px 0 4px}
+  .badges{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 4px}
+  .b{font-family:var(--mono);font-size:12px;background:#e6f5f1;color:var(--accent);border:1px solid #bce4da;padding:3px 10px;border-radius:100px}
+  .sub{color:var(--mut);margin-top:2px}
+  p,li{font-size:15.5px} code{font-family:var(--mono);background:#f2f4f6;padding:1px 5px;border-radius:4px;font-size:13.5px}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#f7f8fa}
+  pre{background:var(--code);color:var(--codefg);border-radius:9px;padding:15px 17px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.5}
+  pre .cm{color:var(--cm)} pre .str{color:var(--str)} pre .kw{color:var(--kw)}
+  .tag{font-family:var(--mono);font-size:11px;padding:1px 7px;border-radius:6px}
+  .t-read{background:var(--readbg);color:var(--read)} .t-med{background:var(--medbg);color:var(--med)} .t-high{background:var(--highbg);color:var(--high)}
+  .lead{background:#eaf6f3;border-left:4px solid var(--accent);padding:12px 16px;border-radius:0 8px 8px 0;margin:14px 0}
+  .note{background:#fff8ec;border-left:4px solid var(--med);padding:10px 15px;border-radius:0 8px 8px 0;margin:14px 0;font-size:14.5px}
+  figure{margin:18px 0;text-align:center} figcaption{color:var(--mut);font-size:13px;margin-top:6px;font-style:italic}
+  ol li{margin:5px 0}
+  .small{color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>👥 CrewAI Worker</h1>
+<p class="sub">A single-agent CrewAI crew that executes goals as tasks — self-governed, and autonomously detected by the AWCP radar.</p>
+<div class="badges">
+  <span class="b">framework: CrewAI</span>
+  <span class="b">model: Ollama · ollama/llama3.1:8b</span>
+  <span class="b">port: 8101</span>
+  <span class="b">folder: agents/crewai_agent</span>
+</div>
+
+<h2>What it is</h2>
+<p>An <b>autonomous worker</b> built on <b>CrewAI</b>. It models the worker as a single crew member with a <b>role / goal / backstory</b>; each goal you submit becomes a CrewAI <b>Task</b> that the crew "kicks off". It runs over a <b>local Ollama model</b> (no keys) and routes its output through its own governed-write path (risk-tiered, with operator approval for high-risk external writes).</p>
+
+<div class="lead">CrewAI's tool-calling support varies by version and model, so this worker leans on the kit's <b>deterministic finalize</b> to guarantee the runtime's output is still persisted through its self-governed write path — governance holds even when the crew doesn't call the write tools itself.</div>
+
+<h2>Architecture — how a goal flows</h2>
+<figure>
+<svg viewBox="0 0 880 210" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif" font-size="12.5">
+  <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#666"/></marker></defs>
+  <rect x="10" y="30" width="110" height="46" rx="8" fill="#e6f5f1" stroke="#b6e0d6"/><text x="65" y="50" text-anchor="middle">POST /tasks</text><text x="65" y="66" text-anchor="middle" fill="#777" font-size="11">a goal</text>
+  <rect x="150" y="30" width="100" height="46" rx="8" fill="#fff" stroke="#ccc"/><text x="200" y="50" text-anchor="middle">queue</text><text x="200" y="66" text-anchor="middle" fill="#777" font-size="11">FIFO</text>
+  <rect x="280" y="20" width="150" height="66" rx="8" fill="#fff" stroke="#ccc"/><text x="355" y="42" text-anchor="middle" font-weight="bold">worker</text><text x="355" y="60" text-anchor="middle" fill="#777" font-size="11">Crew.kickoff(task)</text><text x="355" y="74" text-anchor="middle" fill="#777" font-size="11">role · goal · tools</text>
+  <rect x="460" y="14" width="180" height="80" rx="8" fill="#eafaf0" stroke="#5cba7d"/><text x="550" y="34" text-anchor="middle" font-weight="bold">governed write</text><text x="550" y="52" text-anchor="middle" fill="#0a7d33" font-size="11">approval (if high-risk)</text><text x="550" y="68" text-anchor="middle" fill="#0a7d33" font-size="11">execute → record</text><text x="550" y="84" text-anchor="middle" fill="#777" font-size="11">save_artifact / external_post</text>
+  <rect x="675" y="30" width="120" height="46" rx="8" fill="#fff" stroke="#ccc"/><text x="735" y="50" text-anchor="middle">result</text><text x="735" y="66" text-anchor="middle" fill="#777" font-size="11">+ artifact</text>
+  <line x1="120" y1="53" x2="148" y2="53" stroke="#666" marker-end="url(#ar)"/>
+  <line x1="250" y1="53" x2="278" y2="53" stroke="#666" marker-end="url(#ar)"/>
+  <line x1="430" y1="53" x2="458" y2="53" stroke="#666" marker-end="url(#ar)"/>
+  <line x1="640" y1="53" x2="673" y2="53" stroke="#666" marker-end="url(#ar)"/>
+  <text x="355" y="120" text-anchor="middle" fill="#b45309" font-size="11">the deterministic "finalize" routes the output through its self-governed write path even if the crew doesn't write</text>
+  <line x1="355" y1="86" x2="520" y2="96" stroke="#b45309" stroke-dasharray="3 3" marker-end="url(#ar)"/>
+</svg>
+<figcaption>The shared AWCP worker pipeline, driven here by a CrewAI single-agent crew.</figcaption>
+</figure>
+
+<h2>Features</h2>
+<ul>
+<li><b>Role-based execution</b> — a CrewAI agent with a role/goal/backstory runs each goal as a Task.</li>
+<li><b>Task queue + autonomous worker</b> — goals processed one at a time.</li>
+<li><b>Self-governed writes</b> — risk-tiered; high-risk external writes pause for operator approval (no control plane required).</li>
+<li><b>Risk tiers + approval</b> — <code>save_artifact</code> <span class="tag t-med">medium</span>; <code>external_post</code> <span class="tag t-high">high</span> (pauses for approval).</li>
+<li><b>Deterministic finalize</b> — especially important here, since CrewAI tool-calling is version/model dependent.</li>
+<li><b>Decoupled (autonomously detected)</b>, <b>task-console UI</b>, <b>free/local</b> model.</li>
+</ul>
+
+<h2>Tools</h2>
+<p class="small">Registered as CrewAI tools when the installed CrewAI exposes the tool decorator; governance is guaranteed by the finalize regardless.</p>
+<table>
+<tr><th>Tool</th><th>Type</th><th>What it does</th></tr>
+<tr><td><code>web_search</code></td><td><span class="tag t-read">read</span></td><td>DuckDuckGo web search (no key)</td></tr>
+<tr><td><code>save_artifact</code></td><td><span class="tag t-med">write · medium</span></td><td>persist a result to disk (medium-risk write, approval-free)</td></tr>
+<tr><td><code>external_post</code></td><td><span class="tag t-high">write · high</span></td><td>POST a result to an external system (high-risk; needs operator approval)</td></tr>
+</table>
+
+<h2>HTTP API</h2>
+<table>
+<tr><th>Endpoint</th><th>Purpose</th></tr>
+<tr><td><code>GET /</code></td><td>the task-console web UI</td></tr>
+<tr><td><code>POST /tasks</code> <span class="small">{"goal": "..."}</span></td><td>submit a goal</td></tr>
+<tr><td><code>GET /tasks</code> · <code>GET /tasks/{id}</code></td><td>list / inspect tasks</td></tr>
+<tr><td><code>POST /tasks/{id}/approve</code></td><td>approve/deny a parked high-risk write</td></tr>
+<tr><td><code>GET /info</code> · <code>GET /health</code></td><td>identity / liveness</td></tr>
+</table>
+
+<h2>Configuration (env-driven)</h2>
+<table>
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>CREW_MODEL</code></td><td>ollama/llama3.1:8b</td><td>CrewAI model string (note the <code>ollama/</code> prefix)</td></tr>
+<tr><td><code>CREW_PORT</code></td><td>8101</td><td>port</td></tr>
+<tr><td><code>OLLAMA_BASE</code></td><td>http://localhost:11434</td><td>Ollama endpoint</td></tr>
+<tr><td><code>RADAR_URL</code></td><td>http://localhost:8090</td><td>Agent Radar registry</td></tr>
+<tr><td><code>AGENT_EXTERNAL_WRITE_URL</code></td><td>https://httpbin.org/post</td><td>external write target</td></tr>
+<tr><td><code>AGENT_APPROVAL_REQUIRED</code></td><td>true</td><td>pause high-risk writes for approval</td></tr>
+<tr><td><code>AGENT_FINALIZE_EXTERNAL</code></td><td>false</td><td>also post the result externally each task</td></tr>
+</table>
+
+<h2>How to run</h2>
+<ol>
+<li><b>Model backend:</b>
+<pre>ollama serve
+ollama pull llama3.1:8b      <span class="cm"># first time only</span></pre></li>
+<li><b>(Optional) control plane</b> for live governance:
+<pre>bash telemetry-included/awcp-mcp-temp-main/scripts/run_awcp.sh</pre></li>
+<li><b>Start this worker</b> (auto-creates its venv + installs <code>crewai</code> on first run — first install can take a few minutes):
+<pre>bash agents/crewai_agent/run.sh</pre></li>
+<li><b>Open</b> → <code>http://localhost:8101</code> and give it a goal.</li>
+</ol>
+<p>Or use the control panel: <code>python3 agents/control_panel.py</code> → <code>http://localhost:8099</code>.</p>
+
+<h3>Example goals</h3>
+<pre>What is the capital of France? Report the answer.
+Write a two-sentence summary of what an LLM is, and save it.
+Research a fun fact about octopuses and report it.</pre>
+
+<h2>Governance &amp; its relationship to AWCP</h2>
+<p>This agent is <b>decoupled</b> from the AWCP control plane — it sends <b>nothing</b> to AWCP. Governance is split in two:</p>
+<ul>
+<li><b>Agent-local (enforced here):</b> risk tiers + an <b>operator approval</b> step that pauses high-risk <code>external_post</code> writes until approved on this agent's own <code>POST /tasks/{id}/approve</code> endpoint.</li>
+<li><b>AWCP-side (observe-only):</b> the radar <b>detects this process autonomously</b> by scanning it and lists it (as <code>quarantined</code>, since the agent declares no control hooks) — it can see the agent but does not gate, approve, or degrade it.</li>
+</ul>
+
+<div class="note"><b>Note.</b> CrewAI is the heaviest dependency of the four (first-run install is the slowest). Its tool-calling depends on the installed version + model; the deterministic finalize guarantees the governed write either way.</div>
+
+<p class="small" style="margin-top:30px;border-top:1px solid var(--line);padding-top:12px">Part of the AWCP agent runtimes. The worker engine is shared in <code>agents/crewai_agent/awcp_kit.py</code>; this agent supplies the CrewAI crew and run_goal hook.</p>
+</div>
+</body>
+</html>

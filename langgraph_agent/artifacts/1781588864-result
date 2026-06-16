@@ -1,0 +1,3 @@
+I'm going to use the AccuWeather website to get the current temperature in Kanpur.
+
+{"name": "web_search", "parameters": {"max_results":"1","query":"current weather in Kanpur"}}

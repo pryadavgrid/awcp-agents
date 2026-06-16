@@ -1,0 +1,34 @@
+# =============================================================================
+# AWCP agent runtimes — consolidated requirements (all four agents + shared kit)
+# Python >= 3.10. Everything here is free / local (Ollama); no API keys needed.
+#
+# NOTE: each agent normally runs in its OWN virtualenv, created automatically by
+# its run.sh on first launch — that isolation avoids version clashes between the
+# frameworks. This combined file is for convenience if you want a SINGLE shared
+# environment for all four; installing langgraph + crewai + pydantic-ai together
+# can surface dependency conflicts, so per-agent venvs remain the default.
+#
+# control_panel.py needs NO third-party packages (Python stdlib only).
+# =============================================================================
+
+# --- web server + models (shared by every agent + awcp_kit) ---
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.2.0
+
+# --- shared tool: free web search (awcp_kit.web_search) ---
+ddgs>=6.0.0
+
+# --- LangGraph Orchestrator + arXiv Research Worker ---
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-ollama>=0.2.0
+
+# --- arXiv Research Worker (free arXiv API) ---
+arxiv>=2.1.0
+
+# --- PydanticAI Extractor ---
+pydantic-ai>=0.0.14
+
+# --- CrewAI Writer ---
+crewai>=0.40.0

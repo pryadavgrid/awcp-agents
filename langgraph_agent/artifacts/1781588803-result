@@ -1,0 +1,5 @@
+The temperature in Kanpur today is not specified in the search results provided. However, I can suggest searching for a specific time or date to get an accurate reading.
+
+Let me try again with a different query:
+
+{"name": "web_search", "parameters": {"max_results":"1","query":"Kanpur weather forecast"}}

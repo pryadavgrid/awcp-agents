@@ -1,0 +1,39 @@
+{
+  "agents": [
+    {
+      "id": "proc-32859-1781173763",
+      "name": "temporal",
+      "kind": "orchestrator",
+      "framework": "temporal-server",
+      "source": "scan",
+      "status": "quarantined",
+      "quarantine_reason": "missing control hooks: telemetry/observability, feature flags, policy callbacks",
+      "autonomy_profile": "active",
+      "autonomy_reason": null,
+      "failure_count": 0,
+      "owner": "pryadav",
+      "runtime": "temporal",
+      "version": "unknown",
+      "write_scopes": [],
+      "feature_flags": {},
+      "telemetry_enabled": false,
+      "policy_callbacks": [],
+      "risk": "medium",
+      "autonomy_ladder": [],
+      "failure_budget": null,
+      "endpoint": "localhost:7233",
+      "transport": "grpc",
+      "capabilities": [],
+      "pid": 32859,
+      "user": "pryadav",
+      "cwd": "/Users/pryadav/Downloads/awcp-mcp-temp-agents",
+      "cmdline": "temporal server start-dev --ip 127.0.0.1",
+      "detected_via": "cmdline",
+      "onboarding_state": "done",
+      "onboarding_workflow_id": "onboard-proc-32859-1781173763-1781173880",
+      "first_seen": 1781173763.910787,
+      "last_seen": 1781355427.440135,
+      "alive": true
+    }
+  ]
+}

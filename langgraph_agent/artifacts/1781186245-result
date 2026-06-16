@@ -1,0 +1,3 @@
+I will save the result as an artifact.
+
+save_artifact("The sum of 3 and 4 is: ", 7)
