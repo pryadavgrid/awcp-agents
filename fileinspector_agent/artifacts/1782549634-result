@@ -1,0 +1,22 @@
+The image shows a log of actions taken by an AI system, specifically related to token usage and decision-making processes. Here's a breakdown of the information:
+
+- **Title**: "Running Tools / Actions"
+  - This section indicates that it logs live gate & token-control decisions, including which action was taken, what the decision was, and who called the agent.
+
+- **Columns**:
+  - **TOOL / ACTION**: Lists the specific actions or tools used.
+  - **DECISION**: Describes the outcome of each action (e.g., "deny", "blocked at execution event").
+  - **AGENT**: Identifies which component made the decision (e.g., "PydanticAI Extractor", "LangGraph Orchestrator").
+  - **WHEN**: Indicates when the action was taken.
+
+- **Actions**:
+  1. `save_artifact` with a decision of `"deny (token_hard_stop)"`, executed by `PydanticAI Extractor` one minute ago.
+  2. `Token Hard Stop` with a decision of `"blocked at execution event — token budget exhausted (9780/500)"`, also executed by `PydanticAI Extractor` one minute ago.
+  3. `Degraded Step` with the decision `"ilm_called captured (stage=trace_boost)"`, executed by `PydanticAI Extractor` one minute ago.
+  4. `Degraded` with a decision of `"-> trace_boost"`, executed by `PydanticAI Extractor` one minute ago.
+  5. `Token Exhausted` with the message `"token budget exhausted: 9780/500 in window"` and executed by `PydanticAI Extractor` one minute ago.
+  6. `Token Uncontrolled` with a decision of `"over budget but no local pid or control endpoint — enforcement limited to the gate/deny path"`, also executed by `PydanticAI Extractor` one minute ago.
+  7. Another instance of `Token Hard Stop` with the same message as above, executed by `PydanticAI Extractor` one minute ago.
+  8. A final entry for `Token Uncontrolled` with the same decision and execution details but by a different agent (`LangGraph Orchestrator`) two minutes ago.
+
+This log indicates that there were multiple attempts to perform certain actions (like saving artifacts), which were blocked due to token budget exhaustion or other constraints, leading to degraded states in some processes. The system also logged when these decisions were made and who was responsible for them.

@@ -43,6 +43,21 @@ FINALIZE_EXTERNAL    = os.getenv("AGENT_FINALIZE_EXTERNAL",       "false").lower
 MCP_ENABLED          = os.getenv("AWCP_MCP_ENABLED",             "true").lower() == "true"
 MCP_URL              = os.getenv("AWCP_MCP_URL",                 "http://localhost:8002/sse")
 MCP_TIMEOUT          = float(os.getenv("AWCP_MCP_TIMEOUT",       "30"))
+
+# Only tools whose risk tier is a WRITE (mirrors the MCP server's
+# AWCP_WRITE_RISK_TIERS) are declared to the radar as write_scopes. Read-only
+# tools (low risk: web_search, search_arxiv, get_paper, math, ...) are NOT
+# governed writes, so declaring them as write_scopes wrongly tripped the radar's
+# scope-change re-approval gate and blocked harmless searches. Keep in sync with
+# the server default (medium,high,critical).
+WRITE_RISK_TIERS = frozenset(
+    t.strip().lower()
+    for t in os.getenv("AWCP_WRITE_RISK_TIERS", "medium,high,critical").split(",")
+    if t.strip()
+)
+# The MCP tool catalog discovered at startup, kept so registration can declare
+# ONLY the write-capable tools as write_scopes. Populated by build_tools().
+_DISCOVERED_SPECS: list[dict] = []
 # Heartbeat: the radar prunes a self-registered agent that goes silent for
 # AGENT_RADAR_SELF_PRUNE_AFTER (default 180s). We refresh liveness well inside
 # that window so the agent stays registered (and its write-action gate keeps
@@ -275,6 +290,44 @@ def _radar_call(path: str, payload: dict, timeout: float = 3.0) -> dict:
         return {}
 
 
+def _radar_request_approval(task_id: str, action: str, detail: str, risk: str) -> None:
+    """Surface a paused WRITE action in the AWCP UI's central approval panel
+    (best-effort). The operator approves/denies there; the radar then calls this
+    agent's /tasks/{id}/approve to release the pause."""
+    if not _AGENT_ID:
+        return
+    _radar_call("/approvals", {"agent_id": _AGENT_ID, "task_id": task_id,
+                               "action": action, "detail": detail, "risk": risk})
+
+
+def _risk_is_write(risk: str) -> bool:
+    """A tool call is a WRITE iff its risk tier is in WRITE_RISK_TIERS — the same
+    rule the MCP server / radar gate uses. Drives both write_scope declaration and
+    the pre-write operator-approval pause below."""
+    return (risk or "").lower() in WRITE_RISK_TIERS
+
+
+def _spec_is_write(s: dict) -> bool:
+    """Whether a discovered tool spec is a write. Prefers the server's explicit
+    `write` boolean (authoritative); falls back to the tool's risk tier."""
+    if isinstance(s.get("write"), bool):
+        return s["write"]
+    return _risk_is_write(s.get("risk") or "")
+
+
+def _declared_write_scopes() -> list[str]:
+    """Write scopes to declare at registration: ONLY write-capable tools (per the
+    server's `write` flag, else the risk tier). Read-only tools are intentionally
+    excluded so a search never trips the radar's scope-change re-approval gate.
+    Returns nothing (not all tools) when the catalog is unavailable."""
+    scopes = {
+        (s.get("scope") or s.get("name"))
+        for s in _DISCOVERED_SPECS
+        if _spec_is_write(s) and (s.get("name") or s.get("scope"))
+    }
+    return sorted(scopes)
+
+
 def _radar_register(agent_id: str, meta: dict, port: int) -> None:
     """Self-register with the AWCP radar (best-effort, runs in background thread).
 
@@ -293,7 +346,7 @@ def _radar_register(agent_id: str, meta: dict, port: int) -> None:
         "policy_callbacks": [f"http://localhost:{port}/health"],
         "feature_flags":    {"kill_switch": False},
         "risk":             "medium",
-        "write_scopes":     list(meta.get("tools", [])),
+        "write_scopes":     _declared_write_scopes(),
         "owner":            os.getenv("USER", os.getenv("LOGNAME", "")),
     })
     if resp.get("id"):
@@ -492,14 +545,18 @@ def call_tool(name: str, args: dict | None = None, *, risk: str = "low",
                agent_id=_AGENT_ID, tool=name, action_risk=risk,
                task_id=task["id"] if task else "") as span:
 
-        # HIGH-risk operator approval (kept in this agent's task-console UI).
-        if risk == "high" and APPROVAL_REQUIRED and task is not None:
+        # Operator approval for WRITE actions (medium/high risk — the same
+        # read/write rule the gate uses). Surfaced BOTH in this agent's task
+        # console AND centrally in the AWCP UI (the radar /approvals panel), which
+        # can approve/deny and release this exact pause.
+        if _risk_is_write(risk) and APPROVAL_REQUIRED and task is not None:
             ev = threading.Event()
             _APPROVAL_EVENTS[task["id"]] = ev
             _APPROVAL_DECISION.pop(task["id"], None)
             task["awaiting"] = {"action": name, "detail": detail or name}
             task["status"] = "awaiting_approval"
             _add_step(task, {**step, "status": "awaiting_approval", "info": detail or name})
+            _radar_request_approval(task["id"], name, detail or name, risk)
             _log.info("action.awaiting_approval action=%s task_id=%s", name, task["id"])
             got = ev.wait(timeout=APPROVAL_TIMEOUT)
             _APPROVAL_EVENTS.pop(task["id"], None)
@@ -627,6 +684,8 @@ def build_tools(framework: str, specs: list[dict] | None = None):
     given agent framework. Call once at agent startup; the agent itself declares
     no tools. Supported: langgraph | pydantic_ai | crewai."""
     specs = discover_tools() if specs is None else specs
+    global _DISCOVERED_SPECS
+    _DISCOVERED_SPECS = list(specs or [])
     fw = (framework or "").lower()
     if not specs:
         _log.warning("build_tools: no tools discovered (framework=%s)", fw)
@@ -1134,6 +1193,26 @@ def approve_task(tid: str, decision: str) -> bool:
     return True
 
 
+def cancel_task(tid: str) -> bool:
+    """Cooperatively STOP a task mid-run. The in-flight LLM/tool call can't be
+    force-killed, but we: flag the task so the worker skips finalize writes,
+    release any pending approval wait (as a deny so the run unwinds), and settle
+    it as 'canceled'. The authoritative cancel of the Temporal workflow is done by
+    the gateway, so the control plane records the stop too. Returns True if known."""
+    task = TASKS.get(tid)
+    if not task:
+        return False
+    task["cancel"] = True
+    ev = _APPROVAL_EVENTS.get(tid)
+    if ev:
+        _APPROVAL_DECISION[tid] = "deny"
+        ev.set()
+    if task.get("status") in ("queued", "pending", "running", "awaiting_approval"):
+        task["awaiting"] = None
+        task["status"] = "canceled"
+    return True
+
+
 def governed_action(name: str, risk: str, do_fn=None, detail: str = "",
                     args: dict | None = None, scope: str = ""):
     """Compatibility shim. All tool execution now goes through the MCP governance
@@ -1253,14 +1332,20 @@ def _worker_loop(run_goal) -> None:
                     tools_used=tools_used,
                 )
 
-                # deterministic finalize — route output through gate
-                if FINALIZE_ARTIFACT and not any(s["action"] == "save_artifact" for s in task["steps"]):
-                    save_artifact("result", result or task["goal"])
-                if FINALIZE_EXTERNAL and not any(s["action"] == "external_post" for s in task["steps"]):
-                    external_post((result or task["goal"])[:500])
+                # If the task was STOPPED mid-run, skip the deterministic finalize
+                # writes and settle it as canceled (the gateway also cancels the
+                # Temporal workflow, so the stop is recorded in the control plane).
+                if task.get("cancel"):
+                    task["status"] = "canceled"
+                else:
+                    # deterministic finalize — route output through gate
+                    if FINALIZE_ARTIFACT and not any(s["action"] == "save_artifact" for s in task["steps"]):
+                        save_artifact("result", result or task["goal"])
+                    if FINALIZE_EXTERNAL and not any(s["action"] == "external_post" for s in task["steps"]):
+                        external_post((result or task["goal"])[:500])
 
-                blocked = any(s.get("status") in ("blocked", "denied") for s in task["steps"])
-                task["status"] = "blocked" if blocked else "done"
+                    blocked = any(s.get("status") in ("blocked", "denied") for s in task["steps"])
+                    task["status"] = "blocked" if blocked else "done"
 
                 dur_ms = (time.monotonic() - t0) * 1000
                 _log.info(
@@ -1288,9 +1373,14 @@ def _worker_loop(run_goal) -> None:
                 except Exception:
                     pass
 
-                _finish_execution_workflow(
-                    task["id"], result, task["status"], tools_used
-                )
+                # Don't COMPLETE the workflow if the task was stopped: the gateway
+                # TERMINATES it on stop, and sending a finish signal here would race
+                # and make Temporal show "Completed" instead of "Terminated" (and
+                # leave the close ambiguous). Terminate is authoritative.
+                if not task.get("cancel"):
+                    _finish_execution_workflow(
+                        task["id"], result, task["status"], tools_used
+                    )
                 _radar_signal(_AGENT_ID, ok=(task["status"] == "done"))
 
             except Exception as e:  # noqa: BLE001
@@ -1409,6 +1499,10 @@ def mount(app, *, meta: dict, run_goal, port: int = 8000) -> None:
     @app.post("/tasks/{tid}/approve")
     def _approve(tid: str, req: ApproveReq):
         return {"ok": approve_task(tid, req.decision), "decision": req.decision}
+
+    @app.post("/tasks/{tid}/cancel")
+    def _cancel(tid: str):
+        return {"ok": cancel_task(tid)}
 
     threading.Thread(target=_worker_loop, args=(run_goal,),
                      name="awcp-worker", daemon=True).start()

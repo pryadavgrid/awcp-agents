@@ -1,0 +1,21 @@
+_(Summary model unavailable — showing the file's content directly.)_
+
+4. PHASE 1 — An agent onboards itself (register → magazine → quarantine gate)
+This happens when an agent process starts (the Gateway launches it, or you run run.sh directly).
+
+Step 1 — the agent announces itself. awcp_kit.mount() runs _setup_otel() then self-registers: POST /agents/register (or /agents/announce) to the radar, declaring name, kind, framework, risk, telemetry_enabled, feature_flags, policy_callbacks, control_endpoint. Handled at radar/api.py:1013 register() / api.py:1059 announce(), creating an AgentEntry in the in-memory REGISTRY.
+
+Step 2 — onboarding runs as a Temporal workflow. _onboarding_manager (or announce directly) starts AgentOnboardingWorkflow on the agent-radar-onboarding queue. It is 4 activities, each a named step you can watch in the Temporal UI (onboarding.py workflow):
+
+
+map_identity → quarantine_check → link_mcp → admit
+map_identity (onboarding.py:17) normalizes owner/runtime/version and loads awcp_magazine.json — the central policy file. The magazine is ground truth: it overrides whatever the agent claimed, setting its risk, token_budget, and write_scopes by name. An agent not listed gets __default__ = risk: high, token_budget: 500, write_scopes: [] (fail-closed). This is "the registry checks the policy."
+
+quarantine_check (onboarding.py:49 decide_status) is the admission gate. An agent stays quarantined until it has all three control hooks:
+
+telemetry — observed, not just declared
+feature flags — declared and observed in execution
+policy callbacks — declared and the agent has actually called the gate
+This is the closed-loop trick: declaring a hook isn't trusted. The flags AGENT_RADAR_REQUIRE_OBSERVED_* mean the agent must prove the hook by actually emitting telemetry / calling the gate. Until then it's quarantined — and a quarantined agent is blocked from every governed write (policy.py:198).
+
+Step 3 — auto-promotion. Once the agent runs and emits a real execution event or calls the gate, _observe_telemetry / _observe_policy / _obse …
