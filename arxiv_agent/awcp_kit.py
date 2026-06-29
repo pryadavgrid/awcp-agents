@@ -1481,6 +1481,31 @@ def mount(app, *, meta: dict, run_goal, port: int = 8000) -> None:
     def _health():
         return {"status": "ok", "framework": meta.get("framework"), "agent_id": _AGENT_ID}
 
+    @app.get("/.well-known/agent.json")
+    def _agent_card():
+        """A2A AgentCard — advertises this agent's identity + skills at the
+        well-known URL so the AWCP control plane (onboarding fetch_card) can
+        discover what it can do. Each MCP tool the agent uses is one skill."""
+        tools = list(meta.get("tools", []) or [])
+        return {
+            "name": AGENT_NAME,
+            "description": meta.get("description")
+            or f"AWCP {_AGENT_FRAMEWORK} agent ({_AGENT_MODEL or 'llm'})",
+            "url": f"http://localhost:{port}",
+            "version": str(meta.get("version", "1.0")),
+            "protocol_version": "0.6",
+            "capabilities": {"streaming": False},
+            "skills": [
+                {
+                    "id": t,
+                    "name": t.replace("_", " ").title(),
+                    "description": f"{t} (via the AWCP governed MCP server)",
+                    "tags": [_AGENT_FRAMEWORK],
+                }
+                for t in tools
+            ],
+        }
+
     @app.post("/tasks")
     def _submit(req: GoalReq):
         return submit_task(req.goal)

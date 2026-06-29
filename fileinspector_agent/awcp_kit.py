@@ -441,6 +441,31 @@ def approve_task(tid: str, decision: str) -> bool:
     return True
 
 
+def _cg_checkpoint(name: str, risk: str, outcome: str, detail: str = "", error: str = "") -> None:
+    """Record this governed write as a node in the AWCP context graph — the same
+    tamper-evident step trail the MCP-routed agents feed. fileinspector self-governs
+    its writes locally (it never calls the MCP `execute_tool`), so unlike those agents
+    it has to post its own checkpoint. `outcome` is "succeeded" | "blocked" | "error".
+    Payload shape matches awcp.mcp.server._record_checkpoint so the Neo4j mirror builds
+    the same Step/Tool/Policy/Error nodes. Best-effort: a hiccup never affects the write."""
+    if not (AGENT_RADAR_URL and AGENT_ID):
+        return
+    task = _CURRENT["task"]
+    tid = task["id"] if task else ""
+    decision = "deny" if outcome == "blocked" else "allow"
+    marker = {"blocked": "blocked-at", "error": "errored-at"}.get(outcome, "after")
+    payload = {"tool": name, "risk": risk, "outcome": outcome,
+               "decision": decision, "mode": "self_governed", "reason": error or ""}
+    if error:
+        payload["error"] = error[:500]
+    _radar_post(f"/agents/{AGENT_ID}/checkpoint", {
+        "step": f"tool:{name}", "task_id": tid, "workflow_id": tid, "actor": AGENT_ID,
+        "resume_pointer": f"{tid or 'task'}:{marker}:tool:{name}",
+        "context": {"action": name, "risk": risk, "detail": detail},
+        "payload": payload,
+    })
+
+
 def governed_action(name: str, risk: str, do_fn, detail: str = ""):
     """Run a state-changing action under the agent's OWN local policy:
       1. if HIGH risk, PARK the current task and wait for operator approval;
@@ -468,6 +493,8 @@ def governed_action(name: str, risk: str, do_fn, detail: str = ""):
             _metric("write_total", 1, action=name, risk=risk, outcome="denied")
             _log("write.denied action=%s risk=%s detail=%s", name, risk, detail)
             _span_end(_sp, outcome="denied")
+            _cg_checkpoint(name, risk, "blocked", detail=detail,
+                           error="operator denied" if got else "approval timed out")
             return f"DENIED: external write '{name}' was not approved."
 
     try:
@@ -477,12 +504,14 @@ def governed_action(name: str, risk: str, do_fn, detail: str = ""):
         _metric("write_total", 1, action=name, risk=risk, outcome="done")
         _log("write.done action=%s risk=%s", name, risk)
         _span_end(_sp, outcome="done")
+        _cg_checkpoint(name, risk, "succeeded", detail=detail)
         return out
     except Exception as e:  # noqa: BLE001
         if task:
             _add_step(task, {**step, "status": "failed", "info": str(e)})
         _metric("write_total", 1, action=name, risk=risk, outcome="failed")
         _span_end(_sp, error=e, outcome="failed")
+        _cg_checkpoint(name, risk, "error", detail=detail, error=str(e))
         return f"ERROR: {e}"
 
 
@@ -659,8 +688,13 @@ def _radar_exec_steps(task_id: str, out: dict) -> None:
     for i, tn in enumerate(out.get("tools_used") or []):
         kind = "web_search" if "search" in str(tn).lower() else "tool_called"
         _radar_event(task_id, kind, tool_name=str(tn), call_n=i + 1)
+        # Context graph: record each (read) tool as a step too, so the trail shows
+        # every tool the agent used — not only the governed writes (save_artifact).
+        _cg_checkpoint(str(tn), "low", "succeeded", detail="read tool")
     usage = out.get("usage") or {}
-    _radar_event(task_id, "llm_called", model=AGENT_MODEL, extra={
+    # Report the ACTUAL model used (the vision model for images), so the token
+    # monitor + context graph attribute the call to the right model.
+    _radar_event(task_id, "llm_called", model=out.get("model") or AGENT_MODEL, extra={
         "input_tokens": int(usage.get("input_tokens", 0) or 0),
         "output_tokens": int(usage.get("output_tokens", 0) or 0)})
 
@@ -709,6 +743,29 @@ def mount(app, *, meta: dict, run_goal) -> None:
     @app.get("/health")
     def _health():
         return {"status": "ok", "framework": meta.get("framework")}
+
+    @app.get("/.well-known/agent.json")
+    def _agent_card():
+        """A2A AgentCard — advertises this agent's identity + skills so the AWCP
+        control plane can discover what it can do. Each tool is one skill."""
+        tools = list(meta.get("tools", []) or [])
+        return {
+            "name": AGENT_NAME,
+            "description": meta.get("description") or f"AWCP {AGENT_FRAMEWORK} agent",
+            "url": f"http://localhost:{os.getenv('AGENT_PORT', '8104')}",
+            "version": str(meta.get("version", "1.0")),
+            "protocol_version": "0.6",
+            "capabilities": {"streaming": False},
+            "skills": [
+                {
+                    "id": t,
+                    "name": t.replace("_", " ").title(),
+                    "description": f"{t} (via the AWCP governed MCP server)",
+                    "tags": [AGENT_FRAMEWORK],
+                }
+                for t in tools
+            ],
+        }
 
     @app.post("/tasks")
     def _submit(req: GoalReq):

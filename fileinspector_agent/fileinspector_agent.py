@@ -208,6 +208,20 @@ def read_document(path: str) -> str:
     return _truncate(text)
 
 
+# REAL token usage from the most recent LLM call. describe_image() writes here (it
+# returns a plain string for the tool interface, so it can't return usage inline);
+# run_goal reads it for the image path. The worker runs one task at a time, so a
+# single module-level holder is safe.
+_LAST_LLM_USAGE: dict = {}
+
+
+def _usage_of(resp) -> dict:
+    """Pull {input_tokens, output_tokens} from a LangChain response's usage_metadata."""
+    um = getattr(resp, "usage_metadata", None) or {}
+    return {"input_tokens": int(um.get("input_tokens", 0) or 0),
+            "output_tokens": int(um.get("output_tokens", 0) or 0)}
+
+
 @tool
 def describe_image(path: str,
                    question: str = "Briefly describe what is shown in this image in 2-4 sentences.") -> str:
@@ -227,13 +241,16 @@ def describe_image(path: str,
         b64 = base64.b64encode(buf.getvalue()).decode()
     except Exception as e:  # noqa: BLE001
         return f"Could not load image: {e}"
+    _LAST_LLM_USAGE.clear()  # reset so run_goal only reads THIS call's tokens
     try:
         vlm = ChatOllama(model=VISION_MODEL, base_url=OLLAMA_BASE, temperature=0.2)
         msg = HumanMessage(content=[
             {"type": "text", "text": question},
             {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64}"},
         ])
-        return vlm.invoke([msg]).content
+        resp = vlm.invoke([msg])
+        _LAST_LLM_USAGE.update(_usage_of(resp))  # vision tokens -> token monitor
+        return resp.content
     except Exception as e:  # noqa: BLE001
         return (f"Could not describe this image — the vision model '{VISION_MODEL}' "
                 f"is unavailable ({e}). Install it with `ollama pull {VISION_MODEL}`.")
@@ -313,7 +330,9 @@ def run_goal(goal: str) -> dict:
     if ft == "image":
         question = request or "Briefly describe what is shown in this image in 2-4 sentences."
         tools.append("describe_image")
-        return {"result": describe_image.func(path, question), "tools_used": tools}
+        answer = describe_image.func(path, question)
+        return {"result": answer, "tools_used": tools,
+                "usage": dict(_LAST_LLM_USAGE), "model": VISION_MODEL}
 
     # Documents / text: extract deterministically, then summarise with the text model.
     if ft in ("pdf", "docx", "text"):
@@ -331,10 +350,8 @@ def run_goal(goal: str) -> dict:
         answer = _resp.content
         if _looks_like_junk(answer):
             answer = _brief_fallback(content)
-        _um = getattr(_resp, "usage_metadata", None) or {}
-        _usage = {"input_tokens": int(_um.get("input_tokens", 0) or 0),
-                  "output_tokens": int(_um.get("output_tokens", 0) or 0)}
-        return {"result": answer, "tools_used": tools, "usage": _usage}
+        return {"result": answer, "tools_used": tools,
+                "usage": _usage_of(_resp), "model": MODEL}
     except Exception as e:  # noqa: BLE001  (e.g. Ollama not running) -> still answer
         return {"result": _brief_fallback(content), "tools_used": tools, "error": str(e)}
 
