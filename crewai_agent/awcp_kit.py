@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 # ── Config (all env-driven) ───────────────────────────────────────────────────
@@ -32,8 +33,21 @@ EXTERNAL_WRITE_URL   = os.getenv("AGENT_EXTERNAL_WRITE_URL",      "https://httpb
 EXTERNAL_WRITE_TOKEN = os.getenv("AGENT_EXTERNAL_WRITE_TOKEN",    "")
 APPROVAL_REQUIRED    = os.getenv("AGENT_APPROVAL_REQUIRED",       "true").lower() == "true"
 APPROVAL_TIMEOUT     = float(os.getenv("AGENT_APPROVAL_TIMEOUT",  "180"))
-FINALIZE_ARTIFACT    = os.getenv("AGENT_FINALIZE_ARTIFACT",       "true").lower() == "true"
+# Auto-finalize a save_artifact at the end of EVERY task used to be on — but that
+# is a medium/write action, so it paused each task for operator approval ("save
+# artifact?") and, if cancelled mid-pause, stamped a denied step that surfaced as a
+# spurious "blocked". The durable record of a run is now the chat-history DB
+# (POST /user/chat/turn), so the auto-artifact is OFF by default. Set
+# AGENT_FINALIZE_ARTIFACT=true to restore the old folder write.
+FINALIZE_ARTIFACT    = os.getenv("AGENT_FINALIZE_ARTIFACT",       "false").lower() == "true"
 FINALIZE_EXTERNAL    = os.getenv("AGENT_FINALIZE_EXTERNAL",       "false").lower() == "true"
+# ── Per-chat context memory (backed by the gateway chat-history DB) ────────────
+# Before a task runs, the agent pulls prior turns of the same chat (session_id)
+# from the gateway and prepends a compact conversation preamble so it can reference
+# earlier context. All bounds are env-driven so a long chat can't blow the window.
+CONTEXT_MEMORY_ENABLED = os.getenv("AGENT_CONTEXT_MEMORY", "true").lower() == "true"
+CONTEXT_MAX_TURNS      = int(os.getenv("AGENT_CONTEXT_MAX_TURNS", "8") or 8)
+CONTEXT_MAX_CHARS      = int(os.getenv("AGENT_CONTEXT_MAX_CHARS", "6000") or 6000)
 # ── MCP governance plane (the write-action firewall) ──────────────────────────
 # When enabled, governed tool calls are executed by the AWCP MCP server, which
 # runs the radar write-action gate BEFORE the tool and traces the run as a child
@@ -288,6 +302,86 @@ def _radar_call(path: str, payload: dict, timeout: float = 3.0) -> dict:
             return json.loads(r.read())
     except Exception:
         return {}
+
+
+def _radar_get(path: str, timeout: float = 3.0) -> dict:
+    """GET from the AWCP gateway/radar REST API. Returns response dict or {} on
+    failure (fail-open, like _radar_call)."""
+    try:
+        req = urllib.request.Request(f"{RADAR_URL}{path}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
+            return json.loads(r.read())
+    except Exception:
+        return {}
+
+
+def _fetch_chat_context(session_id: str) -> tuple[str, list[dict]]:
+    """Pull prior turns for this chat from the gateway and render a compact
+    conversation preamble the agent can prepend to the current goal. Returns
+    (preamble, turns). Empty preamble when memory is off, there is no session, or
+    the store is unavailable — the agent then runs with no memory (fail-open)."""
+    if not (CONTEXT_MEMORY_ENABLED and session_id):
+        return "", []
+    resp = _radar_get(f"/user/chat/history/{urllib.parse.quote(session_id)}"
+                      f"?limit={CONTEXT_MAX_TURNS}", timeout=3.0)
+    turns = resp.get("turns") or []
+    # Defensive: only a list is sliceable. Never let a malformed response (or an
+    # unexpected shape) crash the task — just run with no memory.
+    if not isinstance(turns, list) or not turns:
+        return "", []
+    # Oldest→newest, keep only the last N, and cap total size so a long chat can't
+    # overflow the model window.
+    recent = turns[-CONTEXT_MAX_TURNS:]
+    lines: list[str] = []
+    for t in recent:
+        u = (t.get("input") or "").strip()
+        a = (t.get("output") or "").strip()
+        if u:
+            lines.append(f"User: {u}")
+        if a:
+            lines.append(f"Assistant: {a}")
+    if not lines:
+        return "", turns
+    body = "\n".join(lines)
+    if len(body) > CONTEXT_MAX_CHARS:
+        body = "…(earlier turns trimmed)…\n" + body[-CONTEXT_MAX_CHARS:]
+    preamble = ("Here is the earlier conversation in this chat, for context. Use it "
+                "to resolve references like \"it\"/\"that\" and to stay consistent "
+                "with what was already said.\n\n"
+                f"{body}\n\n--- Current request ---\n")
+    return preamble, turns
+
+
+def _persist_chat_turn(task: dict, result: str, status: str, tools_used: list,
+                       tin: int, tout: int, workflow_id: str = "") -> None:
+    """POST one completed turn to the gateway chat-history DB (best-effort). This is
+    the durable record of the run that replaces the artifacts/ folder AND the memory
+    the next turn of this chat reads back."""
+    session_id = task.get("session") or task.get("id")
+    created = task.get("created")
+    started = task.get("started")
+    finished = task.get("finished") or _now()
+    dur_ms = int(((finished - started) if (started and finished) else 0) * 1000)
+    _radar_call("/user/chat/turn", {
+        "session_id":   session_id,
+        "task_id":      task.get("id"),
+        "workflow_id":  workflow_id or "",
+        "agent_id":     _AGENT_ID,
+        "agent_name":   AGENT_NAME,
+        "framework":    _AGENT_FRAMEWORK,
+        "model":        _AGENT_MODEL,
+        "input":        task.get("goal", ""),
+        "output":       result or "",
+        "tools_used":   list(tools_used or []),
+        "status":       status,
+        "input_tokens":  int(tin or 0),
+        "output_tokens": int(tout or 0),
+        "total_tokens":  int((tin or 0) + (tout or 0)),
+        "created_ts":   created,
+        "started_ts":   started,
+        "finished_ts":  finished,
+        "duration_ms":  dur_ms,
+    }, timeout=3.0)
 
 
 def _radar_request_approval(task_id: str, action: str, detail: str, risk: str) -> None:
@@ -1151,10 +1245,14 @@ def _now() -> float:
     return time.time()
 
 
-def submit_task(goal: str) -> dict:
+def submit_task(goal: str, session: str = "") -> dict:
     tid = "task-" + _uuid.uuid4().hex[:10]
+    # A chat = one session_id. When the UI doesn't supply one, fall back to the
+    # task id so a lone task is still its own (single-turn) chat.
     task = {"id": tid, "goal": goal, "status": "queued", "steps": [],
             "result": "", "tools_used": [], "awaiting": None,
+            "session": (session or "").strip() or tid,
+            "input_tokens": 0, "output_tokens": 0,
             "created": _now(), "started": None, "finished": None, "error": ""}
     with _TLOCK:
         TASKS[tid] = task
@@ -1163,9 +1261,10 @@ def submit_task(goal: str) -> dict:
 
 
 def _public_task(t: dict) -> dict:
-    return {k: t[k] for k in ("id", "goal", "status", "steps", "result",
-                              "tools_used", "awaiting", "created", "started",
-                              "finished", "error")}
+    return {k: t.get(k) for k in ("id", "goal", "status", "steps", "result",
+                                  "tools_used", "awaiting", "created", "started",
+                                  "finished", "error", "session",
+                                  "input_tokens", "output_tokens")}
 
 
 def list_tasks() -> list:
@@ -1267,6 +1366,9 @@ def _worker_loop(run_goal) -> None:
             # Start execution workflow BEFORE run_goal so Temporal shows
             # "setup" activity immediately and is ready to receive events.
             _start_execution_workflow(task["id"], task["goal"])
+            # Capture the workflow id now — _finish_execution_workflow pops it, but
+            # we still want it on the persisted chat turn (done/blocked/canceled/failed).
+            task["_wf_id"] = _CURRENT_EXEC_WF.get(task["id"], "")
 
             try:
                 _log.info(
@@ -1282,7 +1384,13 @@ def _worker_loop(run_goal) -> None:
                     call_n=1,
                 )
 
-                out = run_goal(task["goal"]) or {}
+                # Per-chat context memory: prepend a compact preamble of the prior
+                # turns in this chat so the agent can reference earlier context.
+                # Fail-open — an empty preamble means "run with no memory".
+                _ctx_preamble, _ = _fetch_chat_context(task.get("session", ""))
+                _goal_for_run = (_ctx_preamble + task["goal"]) if _ctx_preamble else task["goal"]
+
+                out = run_goal(_goal_for_run) or {}
                 result = str(out.get("result", ""))
                 tools_used = out.get("tools_used", [])
                 task["result"] = result
@@ -1324,6 +1432,10 @@ def _worker_loop(run_goal) -> None:
                         model=_AGENT_MODEL, call_n=llm_n or 1,
                         extra={"input_tokens": _tin, "output_tokens": _tout},
                     )
+                # Stash this turn's REAL token usage on the task so the console can
+                # show the live per-turn count and the chat turn is metered.
+                task["input_tokens"] = _tin
+                task["output_tokens"] = _tout
 
                 # Synthesize — always the final logical step before completion
                 _emit_execution_event(
@@ -1332,20 +1444,26 @@ def _worker_loop(run_goal) -> None:
                     tools_used=tools_used,
                 )
 
-                # If the task was STOPPED mid-run, skip the deterministic finalize
-                # writes and settle it as canceled (the gateway also cancels the
-                # Temporal workflow, so the stop is recorded in the control plane).
+                # If the task was STOPPED mid-run, settle it as canceled and KEEP the
+                # output the agent produced (Temporal shows it too) — a canceled run
+                # must never read as "blocked". We re-check `cancel` AFTER the finalize
+                # writes because a stop can land while a finalize write is mid-gate;
+                # that used to leave a denied step that flipped the status to blocked.
                 if task.get("cancel"):
                     task["status"] = "canceled"
                 else:
-                    # deterministic finalize — route output through gate
+                    # deterministic finalize — route output through gate (off by
+                    # default now; the durable record is the chat-history DB below).
                     if FINALIZE_ARTIFACT and not any(s["action"] == "save_artifact" for s in task["steps"]):
                         save_artifact("result", result or task["goal"])
                     if FINALIZE_EXTERNAL and not any(s["action"] == "external_post" for s in task["steps"]):
                         external_post((result or task["goal"])[:500])
 
-                    blocked = any(s.get("status") in ("blocked", "denied") for s in task["steps"])
-                    task["status"] = "blocked" if blocked else "done"
+                    if task.get("cancel"):
+                        task["status"] = "canceled"
+                    else:
+                        blocked = any(s.get("status") in ("blocked", "denied") for s in task["steps"])
+                        task["status"] = "blocked" if blocked else "done"
 
                 dur_ms = (time.monotonic() - t0) * 1000
                 _log.info(
@@ -1394,6 +1512,21 @@ def _worker_loop(run_goal) -> None:
                 _radar_signal(_AGENT_ID, ok=False, reason=str(e)[:200])
             finally:
                 task["finished"] = _now()
+                # Durable record of this turn (replaces the artifacts/ folder) AND
+                # the memory the next turn of this chat reads back. Covers every
+                # exit path — done / blocked / canceled / failed. Best-effort.
+                try:
+                    _persist_chat_turn(
+                        task,
+                        task.get("result", ""),
+                        task.get("status", ""),
+                        task.get("tools_used", []),
+                        int(task.get("input_tokens") or 0),
+                        int(task.get("output_tokens") or 0),
+                        workflow_id=task.get("_wf_id", ""),
+                    )
+                except Exception:  # noqa: BLE001 — persistence never breaks a task
+                    pass
                 _CURRENT["task"] = None
 
 
@@ -1403,6 +1536,7 @@ from pydantic import BaseModel as _BaseModel  # noqa: E402
 
 class GoalReq(_BaseModel):
     goal: str
+    session: str = ""   # the chat this task belongs to (per-chat context memory)
 
 
 class ApproveReq(_BaseModel):
@@ -1462,7 +1596,9 @@ def mount(app, *, meta: dict, run_goal, port: int = 8000) -> None:
 
     @app.get("/", response_class=HTMLResponse)
     def _home():
-        return TASK_UI_HTML
+        # no-store so a kit update (e.g. the new context-window meter) is picked up
+        # on reload instead of the browser serving a stale cached page.
+        return HTMLResponse(TASK_UI_HTML, headers={"Cache-Control": "no-store"})
 
     @app.get("/info")
     def _info():
@@ -1473,6 +1609,10 @@ def mount(app, *, meta: dict, run_goal, port: int = 8000) -> None:
             "registered":       bool(_AGENT_ID),
             "agent_id":         _AGENT_ID,
             "radar_url":        RADAR_URL,
+            # The gateway that hosts /user/chat/* — the task console reads the chat
+            # history + context-window meter from here (same host as the radar).
+            "gateway_url":      RADAR_URL,
+            "context_memory":   CONTEXT_MEMORY_ENABLED,
             "mcp_enabled":      MCP_ENABLED,
             "mcp_url":          MCP_URL,
         }
@@ -1508,7 +1648,7 @@ def mount(app, *, meta: dict, run_goal, port: int = 8000) -> None:
 
     @app.post("/tasks")
     def _submit(req: GoalReq):
-        return submit_task(req.goal)
+        return submit_task(req.goal, req.session)
 
     @app.get("/tasks")
     def _list():
@@ -1577,8 +1717,21 @@ button.app{background:var(--ok)} button.deny{background:transparent;border:1px s
 .p-running{background:rgba(56,189,248,.14);color:var(--blue)} .p-running .dot{background:var(--blue);animation:pulse 1s infinite}
 .p-awaiting_approval{background:rgba(245,158,11,.16);color:var(--warn)} .p-awaiting_approval .dot{background:var(--warn);animation:pulse 1s infinite}
 .p-done{background:rgba(34,197,94,.14);color:var(--ok)} .p-done .dot{background:var(--ok)}
+.p-canceled{background:rgba(148,163,184,.16);color:var(--mut)} .p-canceled .dot{background:var(--mut)}
 .p-failed,.p-blocked{background:rgba(239,68,68,.14);color:var(--red)} .p-failed .dot,.p-blocked .dot{background:var(--red)}
 @keyframes pulse{50%{opacity:.32}}
+/* Inline context-window meter — Σ tokens for this chat vs the model window.
+   Claude shows this as a circle; here it's a slim in-line bar beside the count. */
+.ctxbar{display:flex;align-items:center;gap:12px;margin:0 0 14px;padding:9px 14px;background:var(--panel);border:1px solid var(--line);border-radius:12px;font-size:12px;color:var(--mut);flex-wrap:wrap}
+.ctxlbl{font-weight:600;color:var(--fg);white-space:nowrap;display:flex;align-items:center;gap:6px}
+.ctxtrack{flex:1;min-width:120px;height:8px;background:var(--panel2);border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.ctxfill{height:100%;width:0;background:linear-gradient(90deg,var(--ok),var(--blue));transition:width .4s ease,background .3s}
+.ctxfill.warn{background:linear-gradient(90deg,var(--warn),#f97316)}
+.ctxfill.full{background:linear-gradient(90deg,var(--red),#b91c1c)}
+.ctxnums{white-space:nowrap;font-family:ui-monospace,monospace}
+.ctxnums b{color:var(--fg)} .ctxsep{color:var(--line)}
+button.sec{background:transparent;border:1px solid var(--line);color:var(--mut)}
+button.sec:hover{color:var(--fg);border-color:var(--acc)}
 .cbody{padding:2px 16px 14px;border-top:1px solid var(--line)}
 .section{margin-top:12px}
 .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);margin-bottom:6px}
@@ -1608,9 +1761,14 @@ button.app{background:var(--ok)} button.deny{background:transparent;border:1px s
   <div class="badges" id="badges"></div>
 </header>
 <div class="wrap">
+  <div class="ctxbar" id="ctxbar">
+    <span class="ctxlbl">&#129504; Context</span>
+    <div class="ctxtrack"><div class="ctxfill" id="ctxfill"></div></div>
+    <span class="ctxnums" id="ctxnums">loading&hellip;</span>
+  </div>
   <div class="composer">
     <textarea id="goal" placeholder="Give the worker a goal..."></textarea>
-    <div class="crow"><div class="examples" id="examples"></div><button id="run">Run task &#9656;</button></div>
+    <div class="crow"><div class="examples" id="examples"></div><button id="newchat" class="sec" title="Start a fresh chat (clears context memory)">New chat</button><button id="run">Run task &#9656;</button></div>
   </div>
   <div class="tasks" id="tasks"><div class="empty">No tasks yet - give the worker a goal above.</div></div>
   <div class="foot" id="foot"></div>
@@ -1618,6 +1776,15 @@ button.app{background:var(--ok)} button.deny{background:transparent;border:1px s
 <script>
 const $=id=>document.getElementById(id);
 let FORMAT='markdown';
+let GATEWAY='';   // set from /info — where /user/chat/* lives (per-chat memory + meter)
+// One browser tab = one chat. The session id survives reloads (sessionStorage) so
+// the agent can recall this chat's earlier turns; "New chat" mints a fresh one.
+const SKEY='awcp_chat_session';
+function newSession(){ return (crypto.randomUUID&&crypto.randomUUID())||('s-'+Math.random().toString(36).slice(2)+Date.now().toString(36)); }
+let SESSION=sessionStorage.getItem(SKEY); if(!SESSION){ SESSION=newSession(); sessionStorage.setItem(SKEY,SESSION); }
+let CTXWIN=128000;   // model context window; overridden by the gateway meter when reachable
+let LAST_TASKS=[];   // last /tasks snapshot — the local token fallback for the meter
+function fmtInt(n){ return (n||0).toLocaleString(); }
 function esc(s){return (s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
 function md(t){ t=esc(t);
   t=t.replace(/```([\s\S]*?)```/g,(m,c)=>'<pre class="cb">'+c.replace(/^\n/,'')+'</pre>');
@@ -1646,13 +1813,48 @@ function card(t){
   return '<div class="card"><div class="chead"><span class="goal">'+esc(t.goal)+'</span><span class="pill p-'+t.status+'"><span class="dot"></span>'+t.status.replace('_',' ')+'</span></div>'+body+'</div>';
 }
 async function refresh(){ let ts=[]; try{ ts=await (await fetch('/tasks')).json(); }catch(e){ return; }
-  $('tasks').innerHTML=ts.length?ts.map(card).join(''):'<div class="empty">No tasks yet - give the worker a goal above.</div>'; }
+  LAST_TASKS=ts;
+  $('tasks').innerHTML=ts.length?ts.map(card).join(''):'<div class="empty">No tasks yet - give the worker a goal above.</div>';
+  meter(); }
+// Local fallback: Σ tokens across THIS chat's tasks from the agent's own /tasks
+// (works even before the gateway persists, or if the gateway is unreachable).
+function localUsed(){ try{ return (LAST_TASKS||[])
+  .filter(t=>(t.session||'')===SESSION)
+  .reduce((s,t)=>s+(t.input_tokens||0)+(t.output_tokens||0),0); }catch(e){ return 0; } }
+function renderMeter(used, win, turns, src){
+  win = win||CTXWIN||1;
+  const pct = Math.round(used*1000/win)/10;
+  $('ctxfill').style.width=Math.min(100,pct)+'%';
+  $('ctxfill').className='ctxfill'+(pct>=100?' full':pct>=80?' warn':'');
+  const left = Math.max(0, Math.round((100-pct)*10)/10);
+  $('ctxnums').innerHTML='<b>'+fmtInt(used)+'</b> / '+fmtInt(win)+' tokens <span class="ctxsep">·</span> '+
+    pct+'% used <span class="ctxsep">·</span> '+left+'% left'+
+    (turns?(' <span class="ctxsep">·</span> '+turns+' turn'+(turns!==1?'s':'')):'')+
+    (src?(' <span class="ctxsep">·</span> '+src):'');
+}
+// Inline context-window meter — ALWAYS shown. Prefers the gateway's authoritative
+// per-chat total (cumulative, persisted); falls back to the local /tasks sum.
+async function meter(){
+  let used=localUsed(), win=CTXWIN, turns=0, src='local';
+  if(GATEWAY){
+    try{
+      const j=await (await fetch(GATEWAY+'/user/chat/history/'+encodeURIComponent(SESSION)+'?limit=1')).json();
+      if(j && j.enabled!==false){ win=j.context_window||win; CTXWIN=win; turns=j.turn_count||0;
+        used=Math.max(used, j.used_tokens||0); src=''; }
+    }catch(e){ /* keep the local fallback */ }
+  }
+  renderMeter(used, win, turns, src);
+}
 async function run(){ const g=$('goal').value.trim(); if(!g)return; $('goal').value=''; $('run').disabled=true;
-  try{ await fetch('/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({goal:g})}); }catch(e){}
+  try{ await fetch('/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({goal:g, session:SESSION})}); }catch(e){}
   $('run').disabled=false; refresh(); }
+function startNewChat(){ SESSION=newSession(); sessionStorage.setItem(SKEY,SESSION);
+  LAST_TASKS=[]; renderMeter(0, CTXWIN, 0, 'new chat'); }
 async function approve(id,d){ try{ await fetch('/tasks/'+id+'/approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decision:d})});}catch(e){} refresh(); }
 async function init(){ try{ const j=await (await fetch('/info')).json();
   FORMAT=j.format||'markdown';
+  GATEWAY=(j.gateway_url||j.radar_url||'').replace(/\/+$/,'');
+  meter();
   if(j.accent) document.documentElement.style.setProperty('--acc',j.accent);
   $('logo').textContent=j.logo||'\u{1F916}'; $('name').textContent=j.agent||'Worker'; document.title=j.agent||'Worker';
   $('purpose').textContent=j.purpose||'';
@@ -1665,8 +1867,9 @@ async function init(){ try{ const j=await (await fetch('/info')).json();
   $('foot').textContent='ext → '+(j.external_url||'')+(j.approval_required?' · high-risk writes need approval':'');
 }catch(e){} }
 $('run').onclick=run;
+$('newchat').onclick=startNewChat;
 $('goal').addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); run(); }});
-init(); refresh(); setInterval(refresh,1500);
+renderMeter(0, CTXWIN, 0, 'local'); init(); refresh(); setInterval(refresh,1500);
 </script>
 </body>
 </html>"""
