@@ -1,3 +1,0 @@
-This file appears to be a JSON configuration file, specifically for a checkout service. It's relatively small, weighing in at 79 bytes.
-
-The contents indicate that the checkout service is configured with version 3, and has two features enabled: cart management and coupons. Additionally, the "enabled" field suggests that this service is currently active.
