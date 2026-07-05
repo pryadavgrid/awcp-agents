@@ -1,5 +1,0 @@
-Based on the output of `classify_file`, the file is a text file.
-
-Next, I will call `read_document` to get more information about the contents of the file.
-
-{"name": "read_document", "parameters": {"path":"/Users/pchandra/Downloads/awcp-mcp-temp-agents/fileinspector_agent/artifacts/uploads/1781346128-fi_invoice.txt"}}

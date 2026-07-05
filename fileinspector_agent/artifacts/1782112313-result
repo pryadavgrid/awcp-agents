@@ -1,1 +1,0 @@
-Could not describe this image — the vision model 'qwen2.5vl:7b' is unavailable ([Errno 61] Connection refused). Install it with `ollama pull qwen2.5vl:7b`.

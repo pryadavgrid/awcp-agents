@@ -1,4 +1,0 @@
-INVOICE 42
-customer: Ada Lovelace
-amount due: 1280.00 USD
-due date: 2026-07-01
