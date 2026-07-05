@@ -382,7 +382,12 @@ APPROVAL_TIMEOUT = float(os.getenv("AGENT_APPROVAL_TIMEOUT", "180"))
 # Both env-tunable (nothing hardcoded): persist the result locally (on by
 # default), and optionally also report it externally (off by default, since that
 # triggers the high-risk approval flow on every task).
-FINALIZE_ARTIFACT = os.getenv("AGENT_FINALIZE_ARTIFACT", "true").lower() == "true"
+# OFF by default: auto-writing a result artifact at the end of EVERY task is a
+# governed write, so with a Tool-Risk-Tier threshold set it would pause each task for
+# a SECOND/THIRD operator approval ("save artifact?"). The real answer is the summary
+# the agent returns, so the auto-artifact adds friction without value. Set
+# AGENT_FINALIZE_ARTIFACT=true to restore the folder write. (Mirrors the sibling kits.)
+FINALIZE_ARTIFACT = os.getenv("AGENT_FINALIZE_ARTIFACT", "false").lower() == "true"
 FINALIZE_EXTERNAL = os.getenv("AGENT_FINALIZE_EXTERNAL", "false").lower() == "true"
 ARTIFACT_DIR = ""   # set by mount() to <agent_dir>/artifacts
 
@@ -466,36 +471,101 @@ def _cg_checkpoint(name: str, risk: str, outcome: str, detail: str = "", error: 
     })
 
 
+# ── Tool Risk Tier gate (operator approval before a ≥threshold tool runs) ─────
+# The hidden OPA agent risk-tiers every tool call (SLM-reasoned) and the operator
+# sets a BLOCK THRESHOLD on the Radar's "Tool Risk Tiers" slider. Any tool whose tier
+# is at/above that threshold must be APPROVED by a human on the AWCP UI before it
+# runs. gate_tool() asks the gateway for the tool's decision and, on "block", PARKS
+# the task, surfaces it in the central Approvals panel, and waits for the operator.
+# Fail-open: if the control plane can't be reached the tool runs (matches the
+# radar-offline → allow philosophy) — an agent is never hard-broken by missing infra.
+def _opa_evaluate(tool_name: str, task_id: str) -> dict:
+    """Ask the gateway what tier the OPA agent assigns this tool and whether it
+    crosses the operator threshold. Returns {risk_tier, decision, engine} or {}."""
+    if not (AGENT_RADAR_URL and tool_name):
+        return {}
+    return _radar_post("/opa/evaluate", {
+        "tool_name": tool_name, "agent_id": AGENT_ID, "task_id": task_id}) or {}
+
+
+def _request_central_approval(task_id: str, action: str, detail: str, risk: str) -> None:
+    """Surface a paused tool call in the AWCP UI's central Approvals panel so the
+    operator can approve/deny it there (the radar releases us via /tasks/<id>/approve)."""
+    _radar_post("/approvals", {
+        "agent_id": AGENT_ID, "task_id": task_id,
+        "action": action, "detail": detail, "risk": risk})
+
+
+def _await_tool_approval(task: dict, tool_name: str, tier: str, detail: str) -> bool:
+    """PARK the current task on a local event and wait for the operator's decision
+    (delivered by the radar to /tasks/<id>/approve). Returns True iff approved."""
+    tid = task["id"]
+    ev = threading.Event()
+    _APPROVAL_EVENTS[tid] = ev
+    _APPROVAL_DECISION.pop(tid, None)
+    task["awaiting"] = {"action": tool_name, "detail": detail, "tier": tier}
+    task["status"] = "awaiting_approval"
+    _add_step(task, {"action": tool_name, "risk": tier, "status": "awaiting_approval",
+                     "info": detail or f"{tier}-risk tool — awaiting operator approval"})
+    _request_central_approval(tid, tool_name, detail or f"{tier}-risk tool call", tier)
+    _log("tool.awaiting_approval tool=%s tier=%s task=%s", tool_name, tier, tid)
+    got = ev.wait(timeout=APPROVAL_TIMEOUT)
+    _APPROVAL_EVENTS.pop(tid, None)
+    task["awaiting"] = None
+    task["status"] = "running"
+    approved = bool(got) and _APPROVAL_DECISION.get(tid) == "approve"
+    _add_step(task, {"action": tool_name, "risk": tier,
+                     "status": "done" if approved else "denied",
+                     "info": ("operator approved" if approved else
+                              ("operator denied" if got else "approval timed out"))})
+    _log("tool.%s tool=%s tier=%s", "approved" if approved else "denied", tool_name, tier)
+    return approved
+
+
+def gate_tool(tool_name: str, detail: str = "") -> bool:
+    """Pre-execution Tool-Risk-Tier gate. Call this BEFORE running any tool. Returns
+    True to proceed, False if the operator denied it (or it is explicitly deny-listed).
+    When the tool's tier is at/above the operator threshold, PARK the task and wait
+    for approval on the AWCP UI. Fail-open when the control plane is unreachable."""
+    task = _CURRENT.get("task")
+    dec = _opa_evaluate(tool_name, task["id"] if task else "")
+    if dec.get("decision") != "block":
+        return True                                    # below threshold → run freely
+    tier = dec.get("risk_tier") or "high"
+    # An EXPLICIT operator deny (Policy tab allow:false) is final — never run it and
+    # never ask (approving would override the operator's own deny).
+    if dec.get("hard_deny"):
+        if task is not None:
+            _add_step(task, {"action": tool_name, "risk": tier, "status": "denied",
+                             "info": dec.get("reason") or "denied by operator policy"})
+        _log("tool.hard_denied tool=%s tier=%s reason=operator_policy", tool_name, tier)
+        return False
+    if task is None or not APPROVAL_REQUIRED:
+        return True                                    # nothing to park / approvals off
+    # Tier is at/above the operator threshold → the human decides on the AWCP UI.
+    return _await_tool_approval(task, tool_name, tier, detail)
+
+
 def governed_action(name: str, risk: str, do_fn, detail: str = ""):
     """Run a state-changing action under the agent's OWN local policy:
-      1. if HIGH risk, PARK the current task and wait for operator approval;
+      1. run the Tool-Risk-Tier gate (operator approval on the AWCP UI when the tool's
+         tier is at/above the threshold, or an explicit operator deny);
       2. execute the write.
-    Records a step on the current task (so the UI shows the trace). No AWCP call
-    is made — this is self-governance; the radar only observes the process."""
+    Records a step on the current task (so the UI shows the trace)."""
     task = _CURRENT["task"]
     step = {"action": name, "risk": risk, "status": "", "info": ""}
     _sp = _span_start("agent.write." + name, action=name, risk=risk, detail=detail)
 
-    if risk == "high" and APPROVAL_REQUIRED and task is not None:
-        ev = threading.Event()
-        _APPROVAL_EVENTS[task["id"]] = ev
-        _APPROVAL_DECISION.pop(task["id"], None)
-        task["awaiting"] = {"action": name, "detail": detail}
-        task["status"] = "awaiting_approval"
-        _add_step(task, {**step, "status": "awaiting_approval", "info": detail})
-        got = ev.wait(timeout=APPROVAL_TIMEOUT)
-        _APPROVAL_EVENTS.pop(task["id"], None)
-        task["awaiting"] = None
-        task["status"] = "running"
-        if not got or _APPROVAL_DECISION.get(task["id"]) != "approve":
-            _add_step(task, {**step, "status": "denied",
-                             "info": "operator denied" if got else "approval timed out"})
-            _metric("write_total", 1, action=name, risk=risk, outcome="denied")
-            _log("write.denied action=%s risk=%s detail=%s", name, risk, detail)
-            _span_end(_sp, outcome="denied")
-            _cg_checkpoint(name, risk, "blocked", detail=detail,
-                           error="operator denied" if got else "approval timed out")
-            return f"DENIED: external write '{name}' was not approved."
+    # Tool-Risk-Tier gate: pauses for operator approval on the AWCP UI when this
+    # tool's SLM tier is at/above the operator threshold (and hard-denies an explicit
+    # operator deny-list entry). Replaces the old hardcoded high-risk-only pause.
+    if not gate_tool(name, detail):
+        _add_step(task, {**step, "status": "denied", "info": "operator denied"}) if task else None
+        _metric("write_total", 1, action=name, risk=risk, outcome="denied")
+        _log("write.denied action=%s risk=%s detail=%s", name, risk, detail)
+        _span_end(_sp, outcome="denied")
+        _cg_checkpoint(name, risk, "blocked", detail=detail, error="operator denied")
+        return f"DENIED: write '{name}' was not approved."
 
     try:
         out = do_fn()
@@ -568,11 +638,18 @@ def _worker_loop(run_goal) -> None:
             task["result"] = result
             task["tools_used"] = out.get("tools_used", [])
             _radar_exec_steps(tid, out)
+            # If a tool was already denied/blocked (e.g. the operator denied it at the
+            # Tool-Risk-Tier gate), don't run the optional finalize writes — the task is
+            # already terminal, and finalizing would just pause for another approval.
+            already_stopped = any(s.get("status") in ("blocked", "denied")
+                                  for s in task["steps"])
             # deterministic finalize — route the runtime's output through the gate
             # even if the model didn't call the write tools on its own.
-            if FINALIZE_ARTIFACT and not any(s["action"] == "save_artifact" for s in task["steps"]):
+            if (FINALIZE_ARTIFACT and not already_stopped
+                    and not any(s["action"] == "save_artifact" for s in task["steps"])):
                 save_artifact("result", result or task["goal"])
-            if FINALIZE_EXTERNAL and not any(s["action"] == "external_post" for s in task["steps"]):
+            if (FINALIZE_EXTERNAL and not already_stopped
+                    and not any(s["action"] == "external_post" for s in task["steps"])):
                 external_post((result or task["goal"])[:500])
             blocked = any(s.get("status") in ("blocked", "denied") for s in task["steps"])
             task["status"] = "blocked" if blocked else "done"
@@ -648,13 +725,22 @@ def _radar_register(meta: dict) -> None:
     global AGENT_ID
     if not AGENT_RADAR_URL:
         return
-    resp = _radar_post("/agents/register", {
+    payload = {
         "name": meta.get("agent", "agent"),
         "framework": meta.get("framework", ""),
         "runtime": "agent_runtime.py",
         "telemetry_enabled": True,
         "risk": os.getenv("AGENT_RISK", "medium"),
-    })
+    }
+    # Register our reachable URL so the radar can RELEASE an operator-approved tool
+    # by calling POST <endpoint>/tasks/<id>/approve. Derived from the port the agent
+    # serves on (meta["port"]); env-overridable for non-localhost deployments.
+    _port = meta.get("port")
+    _endpoint = os.getenv("AWCP_AGENT_PUBLIC_URL") or (
+        f"http://127.0.0.1:{_port}" if _port else "")
+    if _endpoint:
+        payload["endpoint"] = _endpoint
+    resp = _radar_post("/agents/register", payload)
     AGENT_ID = resp.get("id") or ""
 
 
@@ -687,7 +773,10 @@ def _radar_exec_steps(task_id: str, out: dict) -> None:
         return
     for i, tn in enumerate(out.get("tools_used") or []):
         kind = "web_search" if "search" in str(tn).lower() else "tool_called"
-        _radar_event(task_id, kind, tool_name=str(tn), call_n=i + 1)
+        # These tools already cleared the pre-execution Tool-Risk-Tier gate (below
+        # threshold, or operator-approved on the AWCP UI), so mark them approved so the
+        # radar records the tier for the bars without re-blocking the finished task.
+        _radar_event(task_id, kind, tool_name=str(tn), call_n=i + 1, approved=True)
         # Context graph: record each (read) tool as a step too, so the trail shows
         # every tool the agent used — not only the governed writes (save_artifact).
         _cg_checkpoint(str(tn), "low", "succeeded", detail="read tool")

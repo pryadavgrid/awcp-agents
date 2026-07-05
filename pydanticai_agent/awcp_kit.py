@@ -385,13 +385,80 @@ def _persist_chat_turn(task: dict, result: str, status: str, tools_used: list,
 
 
 def _radar_request_approval(task_id: str, action: str, detail: str, risk: str) -> None:
-    """Surface a paused WRITE action in the AWCP UI's central approval panel
+    """Surface a paused tool call in the AWCP UI's central approval panel
     (best-effort). The operator approves/denies there; the radar then calls this
     agent's /tasks/{id}/approve to release the pause."""
     if not _AGENT_ID:
         return
     _radar_call("/approvals", {"agent_id": _AGENT_ID, "task_id": task_id,
                                "action": action, "detail": detail, "risk": risk})
+
+
+def _opa_evaluate(tool_name: str, task_id: str) -> dict:
+    """Ask the gateway what tier the hidden OPA agent assigns this tool and whether
+    it crosses the operator's "Tool Risk Tiers" threshold. Returns
+    {risk_tier, decision ("allow"|"block"), engine} or {} when unreachable/disabled."""
+    if not (RADAR_URL and tool_name):
+        return {}
+    return _radar_call("/opa/evaluate", {
+        "tool_name": tool_name, "agent_id": _AGENT_ID, "task_id": task_id}) or {}
+
+
+# The agent's MODEL call is itself a tiered action: an agent that calls NO tools (a pure
+# LLM responder, e.g. a Q&A agent) still "does something", so at a low-enough operator
+# threshold even a plain answer must be approved on the AWCP UI. AWCP_LLM_CALL_TIER sets
+# that tier (default "low"): it pauses when the tier is in the block set (at/above the
+# slider), and is a no-op otherwise. This is what makes "threshold = low ⇒ every agent
+# asks first" true even for agents with no tools.
+LLM_CALL_TIER = os.getenv("AWCP_LLM_CALL_TIER", "low").strip().lower()
+
+
+def _opa_block_tiers() -> list:
+    """The tiers currently at/above the operator threshold (the block set), read from the
+    gateway's OPA proxy. Empty on any failure so the LLM gate fails OPEN."""
+    if not RADAR_URL:
+        return []
+    try:
+        req = urllib.request.Request(f"{RADAR_URL}/opa/tiers", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as r:  # noqa: S310
+            return [str(t).lower() for t in (json.loads(r.read()).get("block_tiers") or [])]
+    except Exception:
+        return []
+
+
+def _await_approval(task: dict, action: str, tier: str, detail: str) -> bool:
+    """PARK the task on a local event and wait for the operator's decision (delivered by
+    the radar to /tasks/<id>/approve), surfaced centrally in the AWCP UI. True iff approved."""
+    tid = task["id"]
+    ev = threading.Event()
+    _APPROVAL_EVENTS[tid] = ev
+    _APPROVAL_DECISION.pop(tid, None)
+    task["awaiting"] = {"action": action, "detail": detail, "tier": tier}
+    task["status"] = "awaiting_approval"
+    _add_step(task, {"action": action, "risk": tier, "status": "awaiting_approval", "info": detail})
+    _radar_request_approval(tid, action, detail, tier)
+    _log.info("action.awaiting_approval action=%s tier=%s task_id=%s", action, tier, tid)
+    got = ev.wait(timeout=APPROVAL_TIMEOUT)
+    _APPROVAL_EVENTS.pop(tid, None)
+    task["awaiting"] = None
+    task["status"] = "running"
+    approved = bool(got) and _APPROVAL_DECISION.get(tid) == "approve"
+    _add_step(task, {"action": action, "risk": tier,
+                     "status": "done" if approved else "denied",
+                     "info": ("operator approved" if approved else
+                              ("operator denied" if got else "approval timed out"))})
+    return approved
+
+
+def gate_llm_call(task) -> bool:
+    """Gate the agent's model call against the operator threshold. Returns True to run.
+    No-op (True) when approvals are off, there's no task, or the LLM tier is below the
+    threshold; otherwise PARKS for operator approval on the AWCP UI."""
+    if not (APPROVAL_REQUIRED and task is not None):
+        return True
+    if LLM_CALL_TIER not in _opa_block_tiers():
+        return True
+    return _await_approval(task, "llm_call", LLM_CALL_TIER, "the agent's model call")
 
 
 def _risk_is_write(risk: str) -> bool:
@@ -639,19 +706,43 @@ def call_tool(name: str, args: dict | None = None, *, risk: str = "low",
                agent_id=_AGENT_ID, tool=name, action_risk=risk,
                task_id=task["id"] if task else "") as span:
 
-        # Operator approval for WRITE actions (medium/high risk — the same
-        # read/write rule the gate uses). Surfaced BOTH in this agent's task
-        # console AND centrally in the AWCP UI (the radar /approvals panel), which
-        # can approve/deny and release this exact pause.
-        if _risk_is_write(risk) and APPROVAL_REQUIRED and task is not None:
+        # Tool-Risk-Tier gate: the operator's "Tool Risk Tiers" threshold (the Radar
+        # slider) decides which tool calls pause for operator approval — reads and
+        # writes alike. When the hidden OPA agent says this tool's SLM tier is at/above
+        # the threshold we PARK the task and wait for the operator to approve/deny it,
+        # surfaced BOTH in this agent's task console AND centrally in the AWCP UI (the
+        # radar /approvals panel). If the OPA agent is unreachable we fall back to the
+        # write-only rule so writes still pause without it.
+        _tdec = _opa_evaluate(name, task["id"] if task else "")
+        if _tdec:
+            _needs_appr = _tdec.get("decision") == "block"
+            _hard_deny = bool(_tdec.get("hard_deny"))
+            _atier = _tdec.get("risk_tier") or risk
+        else:
+            _needs_appr = _risk_is_write(risk)
+            _hard_deny = False
+            _atier = risk
+        # An EXPLICIT operator deny (Policy tab allow:false) is final — never run it and
+        # never ask (approving would override the operator's own deny). A threshold
+        # crossing instead pauses for approval below.
+        if _hard_deny and task is not None:
+            _add_step(task, {**step, "risk": _atier, "status": "denied",
+                             "info": _tdec.get("reason") or "denied by operator policy"})
+            if span:
+                span.set_attribute("gate.decision", "denied")
+            _log.info("action.hard_denied action=%s tier=%s reason=operator_policy", name, _atier)
+            return f"DENIED: '{name}' is blocked by operator policy (explicit deny)."
+        if _needs_appr and APPROVAL_REQUIRED and task is not None:
             ev = threading.Event()
             _APPROVAL_EVENTS[task["id"]] = ev
             _APPROVAL_DECISION.pop(task["id"], None)
-            task["awaiting"] = {"action": name, "detail": detail or name}
+            task["awaiting"] = {"action": name, "detail": detail or name, "tier": _atier}
             task["status"] = "awaiting_approval"
-            _add_step(task, {**step, "status": "awaiting_approval", "info": detail or name})
-            _radar_request_approval(task["id"], name, detail or name, risk)
-            _log.info("action.awaiting_approval action=%s task_id=%s", name, task["id"])
+            _add_step(task, {**step, "risk": _atier, "status": "awaiting_approval",
+                             "info": detail or name})
+            _radar_request_approval(task["id"], name, detail or name, _atier)
+            _log.info("action.awaiting_approval action=%s tier=%s task_id=%s",
+                      name, _atier, task["id"])
             got = ev.wait(timeout=APPROVAL_TIMEOUT)
             _APPROVAL_EVENTS.pop(task["id"], None)
             task["awaiting"] = None
@@ -659,7 +750,7 @@ def call_tool(name: str, args: dict | None = None, *, risk: str = "low",
             if not got or _APPROVAL_DECISION.get(task["id"]) != "approve":
                 info = "operator denied" if got else "approval timed out"
                 _log.info("action.denied action=%s task_id=%s reason=%s", name, task["id"], info)
-                _add_step(task, {**step, "status": "denied", "info": info})
+                _add_step(task, {**step, "risk": _atier, "status": "denied", "info": info})
                 if span:
                     span.set_attribute("gate.decision", "denied")
                 return f"DENIED: '{name}' was not approved."
@@ -682,8 +773,12 @@ def call_tool(name: str, args: dict | None = None, *, risk: str = "low",
 
         # Temporal: record this tool call (radar maps the event → an activity).
         if task:
+            # approved=True: this tool already cleared the pre-execution Tool-Risk-Tier
+            # gate (below threshold, or operator-approved), so the radar records its tier
+            # for the bars without re-blocking the finished task.
             _emit_execution_event(task["id"], "tool_called", tool_name=name, risk=risk,
-                                  gate="denied" if decision == "deny" else "allowed")
+                                  gate="denied" if decision == "deny" else "allowed",
+                                  approved=True)
 
         if env.get("status") == "blocked" or decision == "deny":
             _log.warning("tool.blocked tool=%s risk=%s reason=%s", name, risk, env.get("reason", ""))
@@ -1376,21 +1471,28 @@ def _worker_loop(run_goal) -> None:
                     _AGENT_ID, task["id"], task["goal"][:200],
                 )
 
-                # Emit the first LLM call event. _AGENT_MODEL is set by mount()
-                # from meta["model"] so it's dynamic for any agent framework.
-                _emit_execution_event(
-                    task["id"], "llm_called",
-                    model=_AGENT_MODEL,
-                    call_n=1,
-                )
-
-                # Per-chat context memory: prepend a compact preamble of the prior
-                # turns in this chat so the agent can reference earlier context.
-                # Fail-open — an empty preamble means "run with no memory".
-                _ctx_preamble, _ = _fetch_chat_context(task.get("session", ""))
-                _goal_for_run = (_ctx_preamble + task["goal"]) if _ctx_preamble else task["goal"]
-
-                out = run_goal(_goal_for_run) or {}
+                # Tool-Risk-Tier gate for the agent's MODEL call: at a low-enough
+                # operator threshold even a plain answer (an agent that calls no tools,
+                # e.g. a pure-LLM responder) must be approved on the AWCP UI before it
+                # runs. A no-op when the LLM tier is below the threshold. Denied → the
+                # agent is not run and the task ends blocked.
+                if gate_llm_call(task):
+                    # Emit the first LLM call event. _AGENT_MODEL is set by mount()
+                    # from meta["model"] so it's dynamic for any agent framework.
+                    _emit_execution_event(
+                        task["id"], "llm_called",
+                        model=_AGENT_MODEL,
+                        call_n=1,
+                    )
+                    # Per-chat context memory: prepend a compact preamble of the prior
+                    # turns in this chat so the agent can reference earlier context.
+                    # Fail-open — an empty preamble means "run with no memory".
+                    _ctx_preamble, _ = _fetch_chat_context(task.get("session", ""))
+                    _goal_for_run = (_ctx_preamble + task["goal"]) if _ctx_preamble else task["goal"]
+                    out = run_goal(_goal_for_run) or {}
+                else:
+                    out = {"result": "⛔ Operator denied this request at the Tool Risk "
+                                     "Tier gate — the agent was not run.", "tools_used": []}
                 result = str(out.get("result", ""))
                 tools_used = out.get("tools_used", [])
                 task["result"] = result

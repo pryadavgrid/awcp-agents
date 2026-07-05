@@ -318,6 +318,9 @@ def run_goal(goal: str) -> dict:
                           "valid FILE_PATH) and I'll tell you what's inside it.",
                 "tools_used": []}
 
+    if not kit.gate_tool("classify_file", detail=os.path.basename(path)):
+        return {"result": "⛔ Operator denied the tool call **classify_file** — the file "
+                          "was not inspected.", "tools_used": [], "denied": True}
     info = _classify(path)
     if "error" in info:
         return {"result": info["error"], "tools_used": ["classify_file"]}
@@ -329,6 +332,9 @@ def run_goal(goal: str) -> dict:
     # Images: the vision model both "reads" and summarises in one step.
     if ft == "image":
         question = request or "Briefly describe what is shown in this image in 2-4 sentences."
+        if not kit.gate_tool("describe_image", detail=os.path.basename(path)):
+            return {"result": "⛔ Operator denied the tool call **describe_image**.",
+                    "tools_used": tools, "denied": True}
         tools.append("describe_image")
         answer = describe_image.func(path, question)
         return {"result": answer, "tools_used": tools,
@@ -336,6 +342,9 @@ def run_goal(goal: str) -> dict:
 
     # Documents / text: extract deterministically, then summarise with the text model.
     if ft in ("pdf", "docx", "text"):
+        if not kit.gate_tool("read_document", detail=os.path.basename(path)):
+            return {"result": "⛔ Operator denied the tool call **read_document**.",
+                    "tools_used": tools, "denied": True}
         content = read_document.func(path)
         tools.append("read_document")
     else:  # binary — nothing readable to summarise
@@ -362,7 +371,7 @@ if __name__ == "__main__":
     kit.mount(
         app,
         meta={"agent": "File Inspector", "framework": "langgraph",
-              "model": MODEL, "tools": TOOL_NAMES, "dir": HERE,
+              "model": MODEL, "tools": TOOL_NAMES, "dir": HERE, "port": PORT,
               "purpose": "Universal file inspector — identify any file (text, image, PDF, JSON, .docx, code, binary) and explain what's inside.",
               "format": "markdown", "accent": "#f59e0b", "logo": "\U0001F5C2",
               "accepts_files": True,
