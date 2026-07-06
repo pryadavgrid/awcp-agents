@@ -18,3 +18,4 @@ opentelemetry-api>=1.42.1
 opentelemetry-sdk>=1.42.1
 opentelemetry-exporter-otlp-proto-grpc>=1.42.1
 protobuf>=6.33.6
+mcp>=1.0.0               # MCP client — fleet tool calls via the assigned MCP server
