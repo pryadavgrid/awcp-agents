@@ -13,7 +13,7 @@ fi
 ./.venv/bin/pip install --quiet -r requirements.txt
 
 LOG="${TMPDIR:-/tmp}/writeup-agent.log"
-echo "📝 Starting Writeup report-writer agent (background) on http://localhost:${WRITEUP_PORT:-8104}"
+echo "📝 Starting Writeup report-writer agent (background) on http://localhost:${WRITEUP_PORT:-8107}"
 echo "   (free / local Ollama model: ${WRITEUP_MODEL:-qwen2.5:7b})"
 nohup ./.venv/bin/python "$PWD/writeup_agent.py" > "$LOG" 2>&1 &
 echo "✅ running — PID $!   logs: $LOG"

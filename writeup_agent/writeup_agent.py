@@ -35,7 +35,7 @@ import awcp_kit as kit
 
 MODEL = os.getenv("WRITEUP_MODEL", "qwen2.5:7b")
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434")
-PORT = int(os.getenv("WRITEUP_PORT", "8104"))
+PORT = int(os.getenv("WRITEUP_PORT", "8107"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # The agent's OUTBOX: every email this agent drafts lands here (via the MCP
