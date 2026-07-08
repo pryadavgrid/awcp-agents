@@ -1,0 +1,16 @@
+# PydanticAI runtime agent — free, local (Ollama). Requires Python >= 3.10.
+# <2: pydantic-ai 2.x removed OpenAIModel (renamed OpenAIChatModel); the agents
+# in this bundle are written against the 1.x API, same as the sibling venvs.
+pydantic-ai>=1.0,<2
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.2.0
+psutil>=5.9.0
+ddgs>=6.0.0
+opentelemetry-exporter-otlp-proto-grpc>=1.20.0
+opentelemetry-instrumentation-logging>=0.40b0
+opentelemetry-instrumentation-fastapi>=0.40b0
+opentelemetry-instrumentation-httpx>=0.40b0
+opentelemetry-instrumentation-requests>=0.40b0
+# MCP client — used to call the AWCP governance-plane MCP server (execute_tool)
+mcp>=1.0.0

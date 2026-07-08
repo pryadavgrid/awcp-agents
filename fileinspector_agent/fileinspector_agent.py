@@ -307,6 +307,70 @@ def _brief_fallback(content: str) -> str:
             + (body[:2000] + (" …" if len(body) > 2000 else "")))
 
 
+# --------------------------------------------------------------------------
+# Goal-aware extension stages — the parts of a goal that go BEYOND inspecting
+# the file. These run on the MCP plane via kit.call_tool: each call executes on
+# this agent's assigned MCP server, and a tool that server doesn't carry (e.g.
+# search_arxiv on DocIntel) is federated by the server to the one that does.
+# --------------------------------------------------------------------------
+RESEARCH_RE = re.compile(r"\b(arxiv|papers?|research|literature|related work)\b", re.I)
+ARTIFACT_RE = re.compile(r"\b(save|persist|store|write)\b[^.!?]*\bartifact\b", re.I)
+ARTIFACT_NAME_RE = re.compile(
+    r"artifact\s+(?:called|named)\s+['\"]?([A-Za-z0-9][\w.-]*)", re.I)
+
+
+def _main_topic(summary: str) -> str:
+    """A short arXiv search query for the document's main topic — model-derived,
+    with a deterministic fallback so research never dies on a model hiccup."""
+    try:
+        r = _llm.invoke([HumanMessage(content=(
+            "Give a 3-8 word academic search query for the MAIN TOPIC of this "
+            "text. Reply with ONLY the query.\n\n" + (summary or "")[:2000]))])
+        topic = (r.content or "").strip().strip('"').splitlines()[0]
+        if 2 < len(topic) < 100:
+            return topic
+    except Exception:  # noqa: BLE001
+        pass
+    return " ".join((summary or "document topic").split()[:8])
+
+
+def _combined_summary(request: str, summary: str, papers: str) -> str:
+    """Fuse the file summary with the arXiv results into the combined summary the
+    goal asked for; plain concatenation when the model is unavailable."""
+    try:
+        r = _llm.invoke([HumanMessage(content=(
+            f"TASK: {request}\n\nDOCUMENT SUMMARY:\n{summary}\n\n"
+            f"ARXIV RESULTS:\n{papers[:6000]}\n\n"
+            "Write ONE combined summary (4-6 sentences): what the document is "
+            "about, then the most relevant papers (title + one line each). "
+            "Plain text only."))])
+        if r.content and len(r.content.strip()) > 30:
+            return r.content.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return summary + "\n\nRelated arXiv results:\n" + papers[:1500]
+
+
+def _extend_goal(request: str, answer: str, tools: list) -> str:
+    """Complete the goal's research / artifact asks after inspection. Best-effort:
+    a denied or failed fleet call leaves the inspection answer intact."""
+    if RESEARCH_RE.search(request or ""):
+        topic = _main_topic(answer)
+        papers = kit.call_tool("search_arxiv", {"query": topic, "max_results": 3},
+                               risk="low", detail=topic)
+        if not str(papers).startswith(("DENIED", "ERROR")):
+            tools.append("search_arxiv")
+            answer = _combined_summary(request, answer, str(papers))
+    if ARTIFACT_RE.search(request or ""):
+        m = ARTIFACT_NAME_RE.search(request)
+        name = m.group(1) if m else "inspection-report"
+        out = kit.call_tool("save_artifact", {"name": name, "content": answer},
+                            risk="medium", detail=name)
+        if not str(out).startswith(("DENIED", "ERROR")):
+            tools.append("save_artifact")
+    return answer
+
+
 def run_goal(goal: str) -> dict:
     """Framework hook: inspect the file referenced by the goal and return a BRIEF
     summary of what's inside it (no metadata). Images are summarised by the vision
@@ -337,6 +401,7 @@ def run_goal(goal: str) -> dict:
                     "tools_used": tools, "denied": True}
         tools.append("describe_image")
         answer = describe_image.func(path, question)
+        answer = _extend_goal(request, answer, tools)
         return {"result": answer, "tools_used": tools,
                 "usage": dict(_LAST_LLM_USAGE), "model": VISION_MODEL}
 
@@ -359,6 +424,7 @@ def run_goal(goal: str) -> dict:
         answer = _resp.content
         if _looks_like_junk(answer):
             answer = _brief_fallback(content)
+        answer = _extend_goal(instruction, answer, tools)
         return {"result": answer, "tools_used": tools,
                 "usage": _usage_of(_resp), "model": MODEL}
     except Exception as e:  # noqa: BLE001  (e.g. Ollama not running) -> still answer

@@ -22,6 +22,7 @@ import json
 import keyword
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -42,6 +43,25 @@ APPROVAL_TIMEOUT     = float(os.getenv("AGENT_APPROVAL_TIMEOUT",  "180"))
 # AGENT_FINALIZE_ARTIFACT=true to restore the old folder write.
 FINALIZE_ARTIFACT    = os.getenv("AGENT_FINALIZE_ARTIFACT",       "false").lower() == "true"
 FINALIZE_EXTERNAL    = os.getenv("AGENT_FINALIZE_EXTERNAL",       "false").lower() == "true"
+
+# Goal-aware finalize: when the GOAL itself explicitly asks to save/persist an
+# artifact and the model forgot to chain the save_artifact call, the worker
+# completes it deterministically at task end. Unlike the always-on auto-finalize
+# above, this fires ONLY for goals that requested it, so ordinary tasks never
+# pause on the write gate. "artifact called/named <x>" names the artifact.
+_ARTIFACT_ASK_RE  = re.compile(r"\b(save|persist|store|write)\b[^.!?]*\bartifact\b",
+                               re.IGNORECASE)
+_ARTIFACT_NAME_RE = re.compile(r"artifact\s+(?:called|named)\s+['\"]?([A-Za-z0-9][\w.-]*)",
+                               re.IGNORECASE)
+
+
+def _goal_wants_artifact(goal: str) -> bool:
+    return bool(_ARTIFACT_ASK_RE.search(goal or ""))
+
+
+def _artifact_name(goal: str) -> str:
+    m = _ARTIFACT_NAME_RE.search(goal or "")
+    return m.group(1) if m else "result"
 # ── Per-chat context memory (backed by the gateway chat-history DB) ────────────
 # Before a task runs, the agent pulls prior turns of the same chat (session_id)
 # from the gateway and prepends a compact conversation preamble so it can reference
@@ -1571,10 +1591,13 @@ def _worker_loop(run_goal) -> None:
                 if task.get("cancel"):
                     task["status"] = "canceled"
                 else:
-                    # deterministic finalize — route output through gate (off by
-                    # default now; the durable record is the chat-history DB below).
-                    if FINALIZE_ARTIFACT and not any(s["action"] == "save_artifact" for s in task["steps"]):
-                        save_artifact("result", result or task["goal"])
+                    # deterministic finalize — route output through gate. Always-on
+                    # finalize stays env-gated (off by default; the durable record is
+                    # the chat-history DB below), but a goal that EXPLICITLY asked to
+                    # save an artifact is completed even when the model forgot to.
+                    if ((FINALIZE_ARTIFACT or _goal_wants_artifact(task["goal"]))
+                            and not any(s["action"] == "save_artifact" for s in task["steps"])):
+                        save_artifact(_artifact_name(task["goal"]), result or task["goal"])
                     if FINALIZE_EXTERNAL and not any(s["action"] == "external_post" for s in task["steps"]):
                         external_post((result or task["goal"])[:500])
 

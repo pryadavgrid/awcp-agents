@@ -546,12 +546,16 @@ def gate_tool(tool_name: str, detail: str = "") -> bool:
     return _await_tool_approval(task, tool_name, tier, detail)
 
 
-def governed_action(name: str, risk: str, do_fn, detail: str = ""):
+def governed_action(name: str, risk: str, do_fn, detail: str = "",
+                    checkpoint: bool = True):
     """Run a state-changing action under the agent's OWN local policy:
       1. run the Tool-Risk-Tier gate (operator approval on the AWCP UI when the tool's
          tier is at/above the threshold, or an explicit operator deny);
       2. execute the write.
-    Records a step on the current task (so the UI shows the trace)."""
+    Records a step on the current task (so the UI shows the trace). `checkpoint`
+    controls the context-graph node: local writes post their own (the graph would
+    never see them otherwise); MCP-routed calls set False because the SERVER
+    records that same step — one node per call, never two."""
     task = _CURRENT["task"]
     step = {"action": name, "risk": risk, "status": "", "info": ""}
     _sp = _span_start("agent.write." + name, action=name, risk=risk, detail=detail)
@@ -564,7 +568,8 @@ def governed_action(name: str, risk: str, do_fn, detail: str = ""):
         _metric("write_total", 1, action=name, risk=risk, outcome="denied")
         _log("write.denied action=%s risk=%s detail=%s", name, risk, detail)
         _span_end(_sp, outcome="denied")
-        _cg_checkpoint(name, risk, "blocked", detail=detail, error="operator denied")
+        if checkpoint:
+            _cg_checkpoint(name, risk, "blocked", detail=detail, error="operator denied")
         return f"DENIED: write '{name}' was not approved."
 
     try:
@@ -574,14 +579,16 @@ def governed_action(name: str, risk: str, do_fn, detail: str = ""):
         _metric("write_total", 1, action=name, risk=risk, outcome="done")
         _log("write.done action=%s risk=%s", name, risk)
         _span_end(_sp, outcome="done")
-        _cg_checkpoint(name, risk, "succeeded", detail=detail)
+        if checkpoint:
+            _cg_checkpoint(name, risk, "succeeded", detail=detail)
         return out
     except Exception as e:  # noqa: BLE001
         if task:
             _add_step(task, {**step, "status": "failed", "info": str(e)})
         _metric("write_total", 1, action=name, risk=risk, outcome="failed")
         _span_end(_sp, error=e, outcome="failed")
-        _cg_checkpoint(name, risk, "error", detail=detail, error=str(e))
+        if checkpoint:
+            _cg_checkpoint(name, risk, "error", detail=detail, error=str(e))
         return f"ERROR: {e}"
 
 
@@ -611,6 +618,53 @@ def external_post(summary: str) -> str:
         with urllib.request.urlopen(req, timeout=15) as r:  # noqa: S310
             return f"external POST {EXTERNAL_WRITE_URL} -> HTTP {r.status}"
     return governed_action("external_post", "high", _do, detail=f"POST {EXTERNAL_WRITE_URL}")
+
+
+# ── MCP tool execution (cross-server) ──────────────────────────────────────────
+# fileinspector runs its OWN file tools locally, but tools it does NOT have —
+# search_arxiv, the sandbox, … — live on the fleet's MCP servers. call_tool runs
+# one of them on this agent's assigned server (AWCP_MCP_URL, injected by the
+# gateway at launch); a tool that server doesn't carry is federated by the server
+# to the one that does. Same governed_action wrapper as the local writes, so the
+# gate / task steps / metrics stay uniform — the SERVER records the governed
+# trail (radar gate, Laminar metering, context-graph node) for the routed call.
+MCP_URL = os.getenv("AWCP_MCP_URL", "http://localhost:8002/sse")
+MCP_TIMEOUT = float(os.getenv("AWCP_MCP_TIMEOUT", "90"))
+
+
+def _mcp_execute(name: str, args: dict) -> str:
+    """One execute_tool call on the assigned MCP server (SSE). Raises on
+    transport failure or a blocked/error envelope so governed_action records
+    the step outcome faithfully."""
+    import asyncio
+
+    async def _call() -> str:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        async with sse_client(MCP_URL) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                task = _CURRENT.get("task") or {}
+                res = await asyncio.wait_for(session.call_tool("execute_tool", {
+                    "tool_name": name, "tool_input": args or {},
+                    "agent_id": AGENT_ID, "task_id": task.get("id", ""),
+                }), timeout=MCP_TIMEOUT)
+                return res.content[0].text if res.content else "{}"
+
+    envelope = json.loads(asyncio.run(_call()))
+    if envelope.get("status") != "succeeded":
+        raise RuntimeError(envelope.get("output")
+                           or envelope.get("reason") or envelope.get("status"))
+    return str(envelope.get("output", ""))
+
+
+def call_tool(name: str, args: dict | None = None, *, risk: str = "low",
+              detail: str = "") -> str:
+    """Execute a fleet tool by name on the MCP plane, governed end to end.
+    Returns the tool output, or a 'DENIED:'/'ERROR:' string on gate/transport
+    failure (same contract as the local governed writes)."""
+    return governed_action(name, risk, lambda: _mcp_execute(name, args or {}),
+                           detail=detail or name, checkpoint=False)
 
 
 def _worker_loop(run_goal) -> None:
@@ -730,6 +784,12 @@ def _radar_register(meta: dict) -> None:
         "framework": meta.get("framework", ""),
         "runtime": "agent_runtime.py",
         "telemetry_enabled": True,
+        # Declare the control hooks onboarding requires (same shape as the other
+        # bundle agents): without these the radar keeps the agent quarantined
+        # forever ("feature flags / policy callbacks: none declared") and every
+        # governed write is denied. Telemetry/policy are then OBSERVED in
+        # execution — the per-step events and the MCP gate calls close the loop.
+        "feature_flags": {"kill_switch": False},
         "risk": os.getenv("AGENT_RISK", "medium"),
     }
     # Register our reachable URL so the radar can RELEASE an operator-approved tool
@@ -740,6 +800,7 @@ def _radar_register(meta: dict) -> None:
         f"http://127.0.0.1:{_port}" if _port else "")
     if _endpoint:
         payload["endpoint"] = _endpoint
+        payload["policy_callbacks"] = [f"{_endpoint}/health"]
     resp = _radar_post("/agents/register", payload)
     AGENT_ID = resp.get("id") or ""
 
@@ -771,15 +832,20 @@ def _radar_exec_steps(task_id: str, out: dict) -> None:
     return; out["usage"] = {input_tokens, output_tokens} when the runtime supplies it."""
     if not (AGENT_RADAR_URL and AGENT_ID):
         return
+    # Tools that ran on the MCP plane already have their checkpoint (the SERVER
+    # records execute_tool runs) — replaying them here would double the trail.
+    # The task's own steps mark them: governed_action recorded each call_tool run.
+    stepped = {s.get("action") for s in ((_CURRENT.get("task") or {}).get("steps") or [])}
     for i, tn in enumerate(out.get("tools_used") or []):
         kind = "web_search" if "search" in str(tn).lower() else "tool_called"
         # These tools already cleared the pre-execution Tool-Risk-Tier gate (below
         # threshold, or operator-approved on the AWCP UI), so mark them approved so the
         # radar records the tier for the bars without re-blocking the finished task.
         _radar_event(task_id, kind, tool_name=str(tn), call_n=i + 1, approved=True)
-        # Context graph: record each (read) tool as a step too, so the trail shows
-        # every tool the agent used — not only the governed writes (save_artifact).
-        _cg_checkpoint(str(tn), "low", "succeeded", detail="read tool")
+        # Context graph: record each LOCAL (read) tool as a step too, so the trail
+        # shows every tool the agent used — MCP-routed ones are already recorded.
+        if str(tn) not in stepped:
+            _cg_checkpoint(str(tn), "low", "succeeded", detail="read tool")
     usage = out.get("usage") or {}
     # Report the ACTUAL model used (the vision model for images), so the token
     # monitor + context graph attribute the call to the right model.
