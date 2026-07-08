@@ -97,6 +97,13 @@ _DISCOVERED_SPECS: list[dict] = []
 # that window so the agent stays registered (and its write-action gate keeps
 # being enforced rather than 404→fail-open) even between tasks. Must be < 180s.
 HEARTBEAT_INTERVAL   = float(os.getenv("AWCP_HEARTBEAT_INTERVAL", "60"))
+# Boot-time self-registration: the radar's register handler starts a Temporal
+# onboarding workflow, which can exceed a short timeout while the control plane
+# is itself booting. Retry instead of giving up — a one-shot register that
+# fails leaves a restarted agent's OLD endpoint in the registry forever.
+REGISTER_ATTEMPTS    = int(os.getenv("AWCP_REGISTER_ATTEMPTS", "5"))
+REGISTER_TIMEOUT     = float(os.getenv("AWCP_REGISTER_TIMEOUT", "10"))
+REGISTER_RETRY_SEC   = float(os.getenv("AWCP_REGISTER_RETRY_SEC", "3"))
 ARTIFACT_DIR = ""    # set by mount()
 AGENT_NAME   = "agent"  # set by mount()
 
@@ -514,8 +521,11 @@ def _radar_register(agent_id: str, meta: dict, port: int) -> None:
 
     Sets telemetry_enabled=True, feature_flags, and policy_callbacks so the radar's
     quarantine check passes and the Temporal onboarding workflow completes as 'active'.
+    Retries with a generous timeout: the register handler starts a Temporal
+    onboarding workflow and can be slow mid-boot, and a silently failed one-shot
+    register leaves this agent's OLD endpoint in the registry until it is pruned.
     """
-    resp = _radar_call("/agents/register", {
+    payload = {
         "id":               agent_id,
         "name":             meta.get("agent", "agent"),
         "kind":             "agent_framework",
@@ -529,14 +539,17 @@ def _radar_register(agent_id: str, meta: dict, port: int) -> None:
         "risk":             "medium",
         "write_scopes":     _declared_write_scopes(),
         "owner":            os.getenv("USER", os.getenv("LOGNAME", "")),
-    })
-    if resp.get("id"):
-        _log.info(
-            "radar.registered agent_id=%s status=%s onboarding=%s",
-            resp["id"], resp.get("status"), resp.get("onboarding_state"),
-        )
-    else:
-        _log.debug("radar.register_skipped reason=radar_unavailable url=%s", RADAR_URL)
+    }
+    for attempt in range(1, max(1, REGISTER_ATTEMPTS) + 1):
+        resp = _radar_call("/agents/register", payload, timeout=REGISTER_TIMEOUT)
+        if resp.get("id"):
+            _log.info(
+                "radar.registered agent_id=%s status=%s onboarding=%s attempt=%d",
+                resp["id"], resp.get("status"), resp.get("onboarding_state"), attempt,
+            )
+            return
+        time.sleep(REGISTER_RETRY_SEC)
+    _log.debug("radar.register_skipped reason=radar_unavailable url=%s", RADAR_URL)
 
 
 def _radar_gate(agent_id: str, action: str) -> str:
