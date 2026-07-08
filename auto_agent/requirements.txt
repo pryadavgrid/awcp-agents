@@ -1,0 +1,19 @@
+# Auto (Smart Router) agent (LangGraph) — free, local Ollama. Python >= 3.10.
+# It binds NO tools: its only outward action is a governed agent call routed
+# through the control plane, so it needs just the LangGraph/Ollama LLM + the kit.
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-ollama>=0.2.0
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.2.0
+psutil>=5.9.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp-proto-grpc>=1.20.0
+opentelemetry-instrumentation-logging>=0.40b0
+opentelemetry-instrumentation-fastapi>=0.40b0
+opentelemetry-instrumentation-httpx>=0.40b0
+opentelemetry-instrumentation-requests>=0.40b0
+# MCP client — imported by the shared awcp_kit at startup even though this agent
+# declares no tools of its own.
+mcp>=1.0.0

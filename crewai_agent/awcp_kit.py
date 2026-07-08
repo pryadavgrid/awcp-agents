@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import keyword
 import logging
 import os
 import threading
@@ -837,6 +838,20 @@ _PY_TYPES = {"str": "str", "int": "int", "float": "float",
              "bool": "bool", "dict": "dict", "list": "list"}
 
 
+def _safe_ident(name: str) -> str:
+    """A valid Python identifier to use in synthesized code for a tool/param name.
+    A tool param can legally be named after a Python keyword (e.g. firecrawl's
+    `from`) or contain non-identifier characters; either makes the generated `def`
+    a SyntaxError. We alias such names to a safe identifier here and map back to
+    the real MCP name when forwarding the call, so tools still work unchanged."""
+    ident = "".join(c if (c.isalnum() or c == "_") else "_" for c in name)
+    if not ident or ident[0].isdigit():
+        ident = "p_" + ident
+    while keyword.iskeyword(ident):
+        ident += "_"
+    return ident
+
+
 def _forward_tool(name: str, args: dict, risk: str) -> str:
     """Drop unset (None) optional args, then run the tool on the MCP server."""
     clean = {k: v for k, v in (args or {}).items() if v is not None}
@@ -853,17 +868,19 @@ def _synth_forwarder(spec: dict):
     parts, callmap = [], []
     for p in spec.get("parameters", []):
         pn = p["name"]
+        var = _safe_ident(pn)  # keyword-/identifier-safe local (e.g. `from` -> `from_`)
         ann = _PY_TYPES.get((p.get("type") or "").strip(), "str")
-        parts.append(f"{pn}: {ann}" if pn in required else f"{pn}: {ann} = None")
-        callmap.append(f"{pn!r}: {pn}")
+        parts.append(f"{var}: {ann}" if pn in required else f"{var}: {ann} = None")
+        callmap.append(f"{pn!r}: {var}")  # forward under the REAL MCP param name
     sig = ", ".join(parts)
     args = "{" + ", ".join(callmap) + "}"
-    src = (f"def {name}({sig}):\n"
+    fname = _safe_ident(name)  # the tool name could also be a keyword/non-identifier
+    src = (f"def {fname}({sig}):\n"
            f"    return _forward({name!r}, {args}, {spec.get('risk', 'low')!r})\n")
     ns = {"_forward": _forward_tool, "str": str, "int": int, "float": float,
           "bool": bool, "dict": dict, "list": list}
     exec(src, ns)  # noqa: S102 — names come from our own MCP catalog
-    fn = ns[name]
+    fn = ns[fname]
     fn.__doc__ = (spec.get("description") or name).strip()
     return fn
 
