@@ -247,24 +247,29 @@ _SETTLED = {"done", "failed", "blocked", "canceled", "awaiting_approval"}
 def _delegate(agent_id: str, query: str) -> dict:
     """Run the chosen agent through the control plane and return its settled result.
 
-    A governed AGENT CALL. Rather than block on /user/ask (which would leave the
-    router on a single opaque step, so its live progress % flat-lines near the cap),
-    we SUBMIT the run and watch it — MIRRORING each new governed step of the
-    delegated agent onto THIS router task's own timeline via the kit's execution
-    events. That advances the router through the same stage milestones the UI
-    already uses (Thinking → Working → Analysing → done), so the bar climbs with the
-    real work and reaches 100 when the run settles.
+    A governed AGENT CALL that stays ONE task: the submit carries THIS router
+    task's id as parent_task_id, so the delegated run JOINS the router's own
+    Temporal workflow and context-graph run — its every governed step (LLM
+    calls, tool calls, checkpoints) lands on this task's timeline directly.
+    The router's live progress % climbs with that real work.
+
+    Older specialists that don't understand parent_task_id still start their own
+    workflow; for those the watch loop below MIRRORS each new governed step onto
+    this task's timeline as before (the sub record has no `joined` flag).
 
     The watch polls the DELEGATED AGENT DIRECTLY (its own lightweight in-memory
-    /tasks record), NOT the gateway's heavy /user/status — so mirroring adds no
+    /tasks record), NOT the gateway's heavy /user/status — so watching adds no
     Temporal/subprocess load to the control plane. The gateway is asked exactly once
     at the end for the AUTHORITATIVE, block-adjusted result.
 
     Empty session: the delegated run is metered as its own turn and never pollutes
     this chat's history — the router's own turn is the one recorded for this chat."""
+    my_task = kit._CURRENT.get("task") or {}
+    my_tid = my_task.get("id") or ""
     sub = kit._radar_call(
         "/user/submit",
-        {"agent": agent_id, "input": query, "auto_start": True, "session": ""},
+        {"agent": agent_id, "input": query, "auto_start": True, "session": "",
+         "parent_task_id": my_tid},
         timeout=max(120.0, DELEGATE_TIMEOUT),
     )
     sub_task = sub.get("task_id")
@@ -275,12 +280,11 @@ def _delegate(agent_id: str, query: str) -> dict:
         # the user still gets a result or the real error.
         return kit._radar_call(
             "/user/ask",
-            {"agent": agent_id, "input": query, "auto_start": True, "session": ""},
+            {"agent": agent_id, "input": query, "auto_start": True, "session": "",
+             "parent_task_id": my_tid},
             timeout=DELEGATE_TIMEOUT,
         )
 
-    my_task = kit._CURRENT.get("task") or {}
-    my_tid = my_task.get("id")
     task_url = f"{agent_url}/tasks/{urllib.parse.quote(sub_task)}"
 
     # Mark the delegation itself as a SUBCALL on this router's Temporal workflow:
@@ -301,19 +305,21 @@ def _delegate(agent_id: str, query: str) -> dict:
         rec = _get_json(task_url, timeout=5.0) or rec
         status = str(rec.get("status", "")).lower()
 
-        # Mirror each NEW governed step (a real tool the sub ran) as a tool_called,
-        # walking the router's % up to the tool milestone as the work happens. Each
-        # mirrored step is namespaced "<agent_id>::<tool>" so the Temporal timeline
-        # reads unambiguously as work done INSIDE the subcall, not by the router. A
-        # tool-free (pure-LLM) run records no steps and simply stays on "Thinking"
-        # until it settles — exactly how a plain LLM agent already behaves here.
+        # A JOINED sub-run (parent_task_id honoured) reports its steps into THIS
+        # task's workflow itself — mirroring would duplicate every activity, so
+        # skip it. For an older specialist that started its own workflow, mirror
+        # each NEW governed step as a tool_called, namespaced "<agent_id>::<tool>"
+        # so the Temporal timeline reads unambiguously as work done INSIDE the
+        # subcall. A tool-free (pure-LLM) run records no steps and simply stays on
+        # "Thinking" until it settles — like a plain LLM agent already does here.
         steps = rec.get("steps") or []
-        for step in steps[mirrored:]:
-            if my_tid:
-                kit._emit_execution_event(my_tid, "tool_called",
-                                          tool_name=f"{agent_id}::{step.get('action')}",
-                                          risk=step.get("risk", "low"),
-                                          subcall=True)
+        if not rec.get("joined"):
+            for step in steps[mirrored:]:
+                if my_tid:
+                    kit._emit_execution_event(my_tid, "tool_called",
+                                              tool_name=f"{agent_id}::{step.get('action')}",
+                                              risk=step.get("risk", "low"),
+                                              subcall=True)
         mirrored = max(mirrored, len(steps))
 
         if status in _SETTLED:
@@ -325,11 +331,19 @@ def _delegate(agent_id: str, query: str) -> dict:
     # One authoritative read from the control plane: it suppresses answers the
     # policy layer blocked (the agent's own record may still hold them) and carries
     # the accurate block reason. Fall back to the agent's record if it's empty.
+    # A JOINED sub-run never had its own workflow — its authoritative outcome
+    # (including any policy block) lives on THIS router task's shared workflow.
+    if rec.get("joined") and kit._CURRENT_EXEC_WF.get(my_tid):
+        workflow_id = kit._CURRENT_EXEC_WF[my_tid]
     status_path = (f"/user/status/{urllib.parse.quote(agent_id)}/"
                    f"{urllib.parse.quote(sub_task)}?workflow_id="
                    f"{urllib.parse.quote(workflow_id)}")
     authoritative = kit._radar_get(status_path, timeout=10.0)
-    return authoritative if authoritative else rec
+    settled = dict(authoritative) if authoritative else dict(rec)
+    # Carry the join marker: the caller must not re-report tools whose real
+    # events already landed on this router task's own workflow.
+    settled["joined"] = bool(rec.get("joined"))
+    return settled
 
 
 def run_goal(goal: str) -> dict:
@@ -366,6 +380,9 @@ def run_goal(goal: str) -> dict:
         # Carry the delegated agent's real tools so the run timeline reflects the
         # work that actually happened downstream.
         "tools_used": sub.get("tools_used", []) or [],
+        # A JOINED run's tool events are already on this task's workflow — tell
+        # the kit not to replay them (they would duplicate on the timeline).
+        "tools_reported": bool(sub.get("joined")),
         "delegated_to": chosen_id,
     }
 

@@ -942,15 +942,21 @@ _OPENAI_CLIENT_ACTIVE = False
 
 
 def _start_execution_workflow(task_id: str, goal: str) -> None:
-    """Ask the radar to start an AgentExecutionWorkflow. Best-effort, synchronous."""
+    """Ask the radar to start an AgentExecutionWorkflow — or JOIN the parent
+    task's workflow when this task is a delegated agent call, so the whole
+    delegated run lands on the caller's own timeline. Best-effort, synchronous."""
+    task = TASKS.get(task_id) or {}
     resp = _radar_call("/tasks/execution/start", {
         "agent_id":  _AGENT_ID,
         "task_id":   task_id,
         "goal":      goal,
         "framework": _AGENT_FRAMEWORK,
+        "parent_task_id": task.get("parent_task_id", ""),
     }, timeout=5.0)
     if resp.get("workflow_id"):
         _CURRENT_EXEC_WF[task_id] = resp["workflow_id"]
+        if resp.get("joined"):
+            task["joined"] = True
         _log.info(
             "exec_workflow.started task_id=%s workflow_id=%s",
             task_id, resp["workflow_id"],
@@ -1360,13 +1366,14 @@ def _now() -> float:
     return time.time()
 
 
-def submit_task(goal: str, session: str = "") -> dict:
+def submit_task(goal: str, session: str = "", parent_task_id: str = "") -> dict:
     tid = "task-" + _uuid.uuid4().hex[:10]
     # A chat = one session_id. When the UI doesn't supply one, fall back to the
     # task id so a lone task is still its own (single-turn) chat.
     task = {"id": tid, "goal": goal, "status": "queued", "steps": [],
             "result": "", "tools_used": [], "awaiting": None,
             "session": (session or "").strip() or tid,
+            "parent_task_id": (parent_task_id or "").strip(),
             "input_tokens": 0, "output_tokens": 0,
             "created": _now(), "started": None, "finished": None, "error": ""}
     with _TLOCK:
@@ -1378,8 +1385,8 @@ def submit_task(goal: str, session: str = "") -> dict:
 def _public_task(t: dict) -> dict:
     return {k: t.get(k) for k in ("id", "goal", "status", "steps", "result",
                                   "tools_used", "awaiting", "created", "started",
-                                  "finished", "error", "session",
-                                  "input_tokens", "output_tokens")}
+                                  "finished", "error", "session", "parent_task_id",
+                                  "joined", "input_tokens", "output_tokens")}
 
 
 def list_tasks() -> list:
@@ -1526,16 +1533,20 @@ def _worker_loop(run_goal) -> None:
                 # Emit tool_called events for any framework-level tools not
                 # already emitted by governed_action or web_search.
                 # Dedup against tools that were already signalled in-flight.
+                # Skipped entirely when the runner reports the tools already
+                # reached this workflow (a JOINED delegated run: the specialist's
+                # own events land on this task's timeline directly).
                 already_emitted = set()
                 for s in task["steps"]:
                     already_emitted.add(s.get("action", ""))
 
-                for tool in tools_used:
-                    if tool not in already_emitted and tool not in ("web_search",):
-                        _emit_execution_event(
-                            task["id"], "tool_called",
-                            tool_name=tool, risk="low", gate="allowed",
-                        )
+                if not out.get("tools_reported"):
+                    for tool in tools_used:
+                        if tool not in already_emitted and tool not in ("web_search",):
+                            _emit_execution_event(
+                                task["id"], "tool_called",
+                                tool_name=tool, risk="low", gate="allowed",
+                            )
 
                 # Emit additional LLM calls if the HTTPX counter shows >1
                 llm_n = getattr(_LLM_CALL_COUNT, "n", 0)
@@ -1662,6 +1673,7 @@ from pydantic import BaseModel as _BaseModel  # noqa: E402
 class GoalReq(_BaseModel):
     goal: str
     session: str = ""   # the chat this task belongs to (per-chat context memory)
+    parent_task_id: str = ""   # set on a DELEGATED agent call — joins the caller's task
 
 
 class ApproveReq(_BaseModel):
@@ -1773,7 +1785,7 @@ def mount(app, *, meta: dict, run_goal, port: int = 8000) -> None:
 
     @app.post("/tasks")
     def _submit(req: GoalReq):
-        return submit_task(req.goal, req.session)
+        return submit_task(req.goal, req.session, req.parent_task_id)
 
     @app.get("/tasks")
     def _list():
